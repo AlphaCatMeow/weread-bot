@@ -1,0 +1,20 @@
+curl 'https://weread.qq.com/web/book/read' \
+  -H 'accept: application/json, text/plain, */*' \
+  -H 'accept-language: zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6' \
+  -H 'baggage: sentry-environment=production,sentry-release=dev-1760449839699,sentry-public_key=ed67ed71f7804a038e898ba54bd66e44,sentry-trace_id=513281e47b064bd8800d2a291360d834' \
+  -H 'content-type: application/json;charset=UTF-8' \
+  -b 'luin=null; lskey=null; user_id=null; session_id=null; eas_sid=Q1b7q4h2q3H998f59833P9I0X1; RK=rHE8nxKeeH; ptcz=023938045b41bf020e17515e71c93965064cf5ecd6f3106f2aa775371ac00f8f; _qpsvr_localtk=0.5959837197527709; uin=null; skey=null; wr_gid=255493729; x-hng=lang=zh-CN&domain=weread.qq.com; wr_vid=908422; wr_pf=3; wr_rt=o2uxBwugzNIna7KA9LsWr3-mphXw%40F5HYUIwkCQTjERF43oZ_AL; wr_ql=1; wr_localvid=fff325c05ddc86fffb8b5ef; wr_name=AlphaCat; wr_gender=1; wr_fp=2150327733; wr_skey=_zzJS2af; wr_avatar=https%3A%2F%2Fthirdwx.qlogo.cn%2Fmmopen%2Fvi_32%2FPiajxSqBRaEIZFZe3tfniaxMUrk0SckMWxEIA3FjJSEyr6dk6nggDbibmSFeEneafSiamfuV13lJVG3AfLc8eSAVwg%2F132' \
+  -H 'dnt: 1' \
+  -H 'origin: https://weread.qq.com' \
+  -H 'priority: u=1, i' \
+  -H 'referer: https://weread.qq.com/web/reader/6e63247072a6d30d6e6d432' \
+  -H 'sec-ch-ua: "Chromium";v="142", "Microsoft Edge";v="142", "Not_A Brand";v="99"' \
+  -H 'sec-ch-ua-mobile: ?0' \
+  -H 'sec-ch-ua-platform: "Windows"' \
+  -H 'sec-fetch-dest: empty' \
+  -H 'sec-fetch-mode: cors' \
+  -H 'sec-fetch-site: same-origin' \
+  -H 'sentry-trace: 513281e47b064bd8800d2a291360d834-86e17da558a87fe0' \
+  -H 'user-agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36 Edg/142.0.0.0' \
+  -H 'x-wrpa-0: 2688c03ed6addb19b1a379e0361203abc83d1f0a085211639f843ef87417a142e2da9cc4e35163f0fda5af61365993a231fdd1a6d07a94ec6f3317fa0f42b38a,cyVsI3MhNjJlVsOzRMKow7gXNigcwp7Cg3bDpMKNOQjCs2EIwot/wpLCpllAwo1pfcOlw7PCkw/CtMKnEQfDr8OXw5TCp8Kmfk/CncKhwo5SKsOUw5PCtcO8U8KmwqcnalDDrMKiw6ZaM8ODwqZFwrDCuEJ0w7TCiwXCicK4YsO9FXDCiMKbVwvCjcK6w5FRKMO9w7nCtcOmTcKgw4AHw6DDtCLDvMOiwr3CuBbDssOlw54HEldQw7nDhcOEIFTCr8OgwrtNwozCkcKSJcOTwoR8wqfCnFnDlClHwofCmMKfF8KawpTCpykvOMKCwpx7wr3DgFfDg8OdDMKew7zCkQjDlhRMLUTCoU5yw5s/e8KIwrcYwponwpzCgEjCoHLDkl0RcRcoEcKecMOZOcKZw4nCusKqwrQRw5TCq3XDl3zCqm3DnUdxEkAtw6RYw54EwrhHHMKAInEVwrzDn8K5LMKzcFzCkGvDucO3N8O2FMOOIXt5NR7CsMOKEBPCqMOT,e8KKw7sSUcKlwqIpVUJ6wollwq0KeXpIw5cewohWwo7DicKuw5x5PW4ewqttw5QBJ8Otw7M/W8KqJcOxw5zCp8OKwrUsccO0w5TDpSfCj8KnCsORNcODaMKQXHTDnibCt8ORcMO+w4JeB8KMMHxIwoxrD2RFLMKJw6HCkGZWwplEbcKrw6pLNnUceV/Cn8KBw71RSy/CuMO4fMKJwovCoyFPw5nDlcKlTMKrwrhPasK1ZAfDplNGHcOb' \
+  --data-raw '{"appId":"wb182564874663h1534425390","b":"6e63247072a6d30d6e6d432","c":"c92326d041022c929f22041","ci":4,"co":6896,"sm":"实；伯夷主礼，上下咸让；垂主工师，百工致","pr":0,"rt":28,"ts":1762167629092,"rn":304,"sg":"14d0ade381a9e92a058b0faea0a182d71f2fe3e4bcf92eaeb575d1f482da2b56","ct":1762167629,"ps":"0de323907a80da9bg019505","pc":"4c6329707a80da9bg01863c","s":"78fe6681"}'
