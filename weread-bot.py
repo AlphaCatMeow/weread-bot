@@ -3576,15 +3576,6 @@ class WeReadSessionManager:
             new_skey = self._extract_wr_skey_from_response(response)
 
             if not new_skey:
-                set_cookie = response.headers.get("set-cookie", "")
-                logging.warning(
-                    "🔍 renewal 响应摘要: status=%s, ql=%s, has_set_cookie=%s, "
-                    "contains_wr_skey=%s",
-                    response.status_code,
-                    self.cookie_data.get("ql"),
-                    bool(set_cookie),
-                    "wr_skey" in set_cookie,
-                )
                 logging.error(
                     self._build_protocol_error(
                         "Cookie 刷新失败",
