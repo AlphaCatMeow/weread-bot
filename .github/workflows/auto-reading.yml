@@ -147,9 +147,15 @@ jobs:
 
       - name: Run WeRead Bot
         env:
+          # Cookie刷新QL属性，根据不同用户的环境，可能需要设置为True或False来确保cookie刷新正常工作，默认值为false
           HACK_COOKIE_REFRESH_QL: ${{ secrets.HACK_COOKIE_REFRESH_QL }}
+          # 多用户 cURL：在 WEREAD_CURL_STRING 中放置多段 curl，段与段之间至少插入两个空行
           WEREAD_CURL_STRING: ${{ secrets.WEREAD_CURL_STRING }}
+          # 多用户并发控制，未设置默认 1（顺序执行）
           MAX_CONCURRENT_USERS: ${{ secrets.MAX_CONCURRENT_USERS || 1 }}
+          # 单用户连续阅读失败上限，未设置时默认 5
+          MAX_CONSECUTIVE_FAILURES: ${{ secrets.MAX_CONSECUTIVE_FAILURES || 5 }}
+          # 通知相关环境变量
           PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
@@ -171,6 +177,7 @@ jobs:
           GOTIFY_TOKEN: ${{ secrets.GOTIFY_TOKEN }}
           GOTIFY_PRIORITY: ${{ secrets.GOTIFY_PRIORITY }}
           GOTIFY_TITLE: ${{ secrets.GOTIFY_TITLE }}
+          # 代理设置（可选）
           HTTP_PROXY: ${{ secrets.HTTP_PROXY }}
           HTTPS_PROXY: ${{ secrets.HTTPS_PROXY }}
           SERVERCHAN3_UID: ${{ secrets.SERVERCHAN3_UID }}
@@ -179,11 +186,26 @@ jobs:
           SERVERCHAN3_SHORT: ${{ secrets.SERVERCHAN3_SHORT }}
           PUSHDEER_PUSHKEY: ${{ secrets.PUSHDEER_PUSHKEY }}
           PUSHDEER_TYPE: ${{ secrets.PUSHDEER_TYPE }}
+          NOTIFICATION_ONLY_ON_FAILURE: ${{ secrets.NOTIFICATION_ONLY_ON_FAILURE || github.event.inputs.notify_only_on_failure == 'true' || 'false' }}
+          HISTORY_ENABLED: ${{ secrets.HISTORY_ENABLED || github.event.inputs.history_enabled == 'true' || 'true' }}
+          HISTORY_FILE: ${{ secrets.HISTORY_FILE || 'logs/run-history.json' }}
+          HISTORY_MAX_ENTRIES: ${{ secrets.HISTORY_MAX_ENTRIES || github.event.inputs.history_max_entries || '50' }}
+          HISTORY_PERSIST_RUNTIME_ERROR: ${{ secrets.HISTORY_PERSIST_RUNTIME_ERROR || 'true' }}
+          # 其他环境变量
           TZ: 'Asia/Shanghai'
         run: |
           echo "开始自动阅读任务..."
           echo "当前时间: $(date)"
-          echo "阅读时长: ${TARGET_DURATION}"
+          echo "运行参数:"
+          echo "- 阅读时长: ${TARGET_DURATION}"
+          echo "- 阅读模式: ${{ github.event.inputs.reading_mode || 'smart_random' }}"
+          echo "- 启用通知: ${{ github.event.inputs.notify_enabled != 'false' }}"
+          echo "- 仅失败通知: ${{ github.event.inputs.notify_only_on_failure == 'true' }}"
+          echo "- 历史持久化: ${{ github.event.inputs.history_enabled != 'false' }}"
+          echo "- 历史保留条数: ${{ github.event.inputs.history_max_entries || '50' }}"
+          echo "================================"
+
+          # 运行阅读机器人
           python weread-bot.py --config config.yaml
 
       - name: Upload runtime artifacts
