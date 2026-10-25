@@ -81,12 +81,16 @@ reading:
 # 人类行为模拟，如果希望快速完成阅读可关闭模拟
 human_simulation:
   enabled: true   # 是否开启人类行为模拟（true=更自然防检测，false=快速跑完）
-  # 阅读速度是否变化
+  # 阅读速度是否变化：每次会话随机整体速度（0.8-1.25 倍），阅读中缓慢漂移
   reading_speed_variation: true
-  # 中途休息概率（0-1）
+  # 每页休息概率（0-1）；连续 8 页内不会重复休息，读得越久概率越高（30 分钟后翻倍）
   break_probability: 0.1
-  # 休息时长（秒）
+  # 休息时长（秒），多数偏短、偶尔较长；休息时间不计入上报的阅读时长
   break_duration: "5-20"
+  # 每页开始连续快速翻 2-4 页（略读）的概率（0-1）
+  skim_probability: 0.08
+  # 每页停留较久（reading_interval 上限的 1-2.5 倍）的概率（0-1），与 skim_probability 之和不超过 1
+  long_read_probability: 0.06
   # User-Agent轮换（会话级别，非请求级别），建议不轮换，默认使用 curl 自带的 User-Agent
   rotate_user_agent: false
 

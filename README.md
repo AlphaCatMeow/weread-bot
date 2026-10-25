@@ -175,6 +175,9 @@ python weread-bot.py --show-last-run --config config.yaml
 # 微信扫码登录，生成 CURL 文件
 python weread-bot.py --login --config config.yaml
 
+# 运行后把刷新后的 Cookie 和阅读位置写回 CURL 文件（GitHub Actions 用它回写 Secret）
+python weread-bot.py --config config.yaml --save-curl ./curl_command.txt
+
 # 查看所有可用命令
 python weread-bot.py --help
 ```
@@ -185,6 +188,7 @@ python weread-bot.py --help
 - `--dry-run` 会在 `--validate-config` 的基础上继续输出通知触发配置、通道就绪状态、缺失字段和禁用通道摘要，但不会真正发起阅读请求。
 - `--show-last-run` 只读取 `history.file` 指向的本地历史文件，输出最近一次真实执行摘要后退出，不会初始化阅读会话。
 - `--login` 扫码登录后把认证信息写入 CURL 文件并退出，详见[扫码登录（免抓包）](#扫码登录免抓包)。
+- `--save-curl` 在每轮会话结束后写入刷新后的 Cookie 和当前阅读位置，多用户按配置顺序写成空两行分隔的多段，格式同 `WEREAD_CURL_STRING`；没有用户刷新成功时不写入。
 - 真实执行结束后，如 `history.enabled=true`，程序会把最近执行摘要写入默认文件 `logs/run-history.json`。
 - 历史记录只保存时间、状态、用户数、阅读统计和失败分类等摘要，不会保存 Cookie、请求头或原始 CURL。
 - 如果 `curl_config.users[].reading_overrides` 中存在不支持的键，程序会直接提示对应配置路径。
@@ -304,16 +308,21 @@ open config-generator.html
 | 连续失败上限 | `MAX_CONSECUTIVE_FAILURES` | `5` | 达到上限后结束当前用户会话并记为失败 |
 | 书籍连续性 | `BOOK_CONTINUITY` | `0.8` | 继续当前书籍的概率（0-1） |
 | 章节连续性 | `CHAPTER_CONTINUITY` | `0.7` | 顺序阅读章节的概率（0-1） |
+| 书籍列表 | `WEREAD_BOOKS` | 无 | JSON 列表，结构同 `reading.books`，设置后替代配置文件中的书籍 |
 
 ### 人类行为模拟配置
 
 | 配置项 | 环境变量 | 默认值 | 说明 |
 |--------|----------|--------|------|
 | 行为模拟 | `HUMAN_SIMULATION_ENABLED` | `false` | 是否启用人类行为模拟 |
-| 阅读速度变化 | `READING_SPEED_VARIATION` | `true` | 是否变化阅读速度 |
-| 休息概率 | `BREAK_PROBABILITY` | `0.1` | 中途休息概率（0-1） |
-| 休息时长 | `BREAK_DURATION` | `10-20` | 休息时长（秒） |
+| 阅读速度变化 | `READING_SPEED_VARIATION` | `true` | 每次会话随机整体速度，阅读中缓慢漂移 |
+| 休息概率 | `BREAK_PROBABILITY` | `0.1` | 每页休息概率（0-1），连续 8 页内不重复休息，读得越久越高 |
+| 休息时长 | `BREAK_DURATION` | `10-20` | 休息时长（秒），休息时间不计入上报的阅读时长 |
+| 略读概率 | `SKIM_PROBABILITY` | `0.08` | 每页开始连续快速翻 2-4 页的概率（0-1） |
+| 细读概率 | `LONG_READ_PROBABILITY` | `0.06` | 每页停留较久的概率（0-1） |
 | User-Agent轮换 | `ROTATE_USER_AGENT` | `false` | 是否轮换User-Agent |
+
+启用行为模拟后，翻页间隔不再在 `reading_interval` 区间内均匀取值，而是以区间中点乘以会话速度为中心的对数正态分布，并夹杂略读（区间下限的 15%-40%）和细读（区间上限的 1-2.5 倍）。
 
 > 示例配置和 GitHub Actions 场景可能会覆盖这些默认值；以上为未提供配置时的程序内置默认值。
 

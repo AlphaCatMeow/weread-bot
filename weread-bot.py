@@ -430,6 +430,8 @@ class HumanSimulationConfig:
     break_probability: float = 0.15
     break_duration: str = "30-180"
     rotate_user_agent: bool = True
+    skim_probability: float = 0.08  # 每页开始连续快速翻页的概率
+    long_read_probability: float = 0.06  # 每页停留较久的概率
 
 
 @dataclass
@@ -922,6 +924,24 @@ def validate_config_semantics(config: WeReadConfig) -> None:
         "human_simulation.break_duration",
         0,
     )
+    skim_probability = parse_float(
+        config.human_simulation.skim_probability,
+        "human_simulation.skim_probability",
+        0,
+        1,
+    )
+    long_read_probability = parse_float(
+        config.human_simulation.long_read_probability,
+        "human_simulation.long_read_probability",
+        0,
+        1,
+    )
+    if skim_probability + long_read_probability > 1:
+        raise _config_error(
+            "human_simulation.long_read_probability",
+            "与 skim_probability 之和不能超过 1",
+            long_read_probability,
+        )
     parse_range(config.daemon.session_interval, "daemon.session_interval", 0)
     parse_int(config.daemon.max_daily_sessions, "daemon.max_daily_sessions", 1)
     config.logging.level = parse_choice(
@@ -1112,6 +1132,14 @@ class ConfigManager:
                 config_data, "human_simulation.rotate_user_agent",
                 "ROTATE_USER_AGENT", False
             ),
+            skim_probability=parse_float(self._get_config_value(
+                config_data, "human_simulation.skim_probability",
+                "SKIM_PROBABILITY", "0.08"
+            ), "human_simulation.skim_probability", 0, 1),
+            long_read_probability=parse_float(self._get_config_value(
+                config_data, "human_simulation.long_read_probability",
+                "LONG_READ_PROBABILITY", "0.06"
+            ), "human_simulation.long_read_probability", 0, 1),
         )
 
         # 加载通知配置
@@ -1225,10 +1253,21 @@ class ConfigManager:
         """加载书籍配置"""
         books = []
 
-        # 从YAML配置加载
-        books_config = self._get_nested_dict_value(
-            config_data, "reading.books"
-        )
+        # 环境变量 WEREAD_BOOKS（JSON 列表，结构同 reading.books）优先于 YAML
+        books_env = self._get_env_override("WEREAD_BOOKS")
+        if books_env:
+            try:
+                books_config = json.loads(books_env)
+            except json.JSONDecodeError as exc:
+                raise ConfigError(
+                    f"WEREAD_BOOKS: 不是合法的 JSON，{exc.msg}"
+                ) from exc
+            if not isinstance(books_config, list):
+                raise _config_error("WEREAD_BOOKS", "必须是 JSON 列表", books_config)
+        else:
+            books_config = self._get_nested_dict_value(
+                config_data, "reading.books"
+            )
         if books_config and isinstance(books_config, list):
             for book_data in books_config:
                 if isinstance(book_data, dict):
@@ -2336,37 +2375,69 @@ class SmartReadingManager:
 class HumanBehaviorSimulator:
     """人类行为模拟器"""
 
+    # 两次休息之间至少翻过的页数
+    MIN_PAGES_BETWEEN_BREAKS = 8
+    # 阅读多久后休息概率翻倍（秒）
+    FATIGUE_SECONDS = 1800
+
     def __init__(self, config: HumanSimulationConfig):
         self.config = config
-        self.last_speed_change = 0
-        self.current_speed_factor = 1.0
+        variation = config.enabled and config.reading_speed_variation
+        # 会话级整体速度：有时读得快，有时读得慢
+        self.session_pace = random.uniform(0.8, 1.25) if variation else 1.0
+        self.speed_drift = 1.0
+        self.skim_pages_left = 0
+        self.pages_since_break = 0
 
-    def should_take_break(self) -> bool:
-        """判断是否应该休息"""
+    def should_take_break(self, elapsed_seconds: float = 0) -> bool:
+        """判断翻页前是否休息：读得越久越容易休息，刚休息过不会马上再休息"""
         if not self.config.enabled:
             return False
-        return random.random() < self.config.break_probability
+        self.pages_since_break += 1
+        if self.pages_since_break <= self.MIN_PAGES_BETWEEN_BREAKS:
+            return False
+        fatigue = 1 + max(0.0, elapsed_seconds) / self.FATIGUE_SECONDS
+        if random.random() < min(1.0, self.config.break_probability * fatigue):
+            self.pages_since_break = 0
+            self.skim_pages_left = 0
+            return True
+        return False
 
     def get_break_duration(self) -> int:
-        """获取休息时长"""
-        return RandomHelper.get_random_int_from_range(
-            self.config.break_duration
-        )
+        """获取休息时长：多数较短，偶尔较长"""
+        low, high = RandomHelper.parse_range(self.config.break_duration)
+        if not self.config.enabled:
+            return int(random.uniform(low, high))
+        return int(low + (high - low) * random.betavariate(1.5, 3))
 
     def get_reading_interval(self, base_interval: str) -> float:
-        """获取阅读间隔（考虑速度变化）"""
-        base_time = RandomHelper.get_random_from_range(base_interval)
+        """获取翻页间隔：围绕当前速度的对数正态分布，夹杂略读和细读"""
+        low, high = RandomHelper.parse_range(base_interval)
+        if not self.config.enabled:
+            return random.uniform(low, high)
 
-        if self.config.enabled and self.config.reading_speed_variation:
-            # 每30秒左右改变一次阅读速度
-            current_time = time.time()
-            if current_time - self.last_speed_change > 30:
-                self.current_speed_factor = random.uniform(0.8, 1.3)
-                self.last_speed_change = current_time
+        skim_low, skim_high = max(1.0, low * 0.15), max(2.0, low * 0.4)
+        if self.skim_pages_left > 0:
+            self.skim_pages_left -= 1
+            return random.uniform(skim_low, skim_high)
 
-            return base_time * self.current_speed_factor
+        roll = random.random()
+        if roll < self.config.skim_probability:
+            # 连续快速翻 2-4 页
+            self.skim_pages_left = random.randint(1, 3)
+            return random.uniform(skim_low, skim_high)
+        if roll < self.config.skim_probability + self.config.long_read_probability:
+            return random.uniform(high, high * 2.5)
 
-        return base_time
+        if self.config.reading_speed_variation:
+            self.speed_drift = min(
+                1.2, max(0.85, self.speed_drift * random.uniform(0.95, 1.05))
+            )
+        median = (low + high) / 2 * self.session_pace * self.speed_drift
+        if median <= 0:
+            return random.uniform(low, high)
+        interval = random.lognormvariate(math.log(median), 0.25)
+        return min(high * 1.8, max(low * 0.5, interval))
 
 
 # ==========================
@@ -2927,10 +2998,14 @@ class WeReadApplication:
     _daily_session_count = 0
     _last_session_date = None
     _last_run_summary: Dict[str, Any] = {}
+    # 用户名 -> (导出的 CURL, 本次是否刷新 Cookie 成功)
+    _curl_exports: Dict[str, Tuple[str, bool]] = {}
 
-    def __init__(self, config: WeReadConfig, execution_type: str = "normal"):
+    def __init__(self, config: WeReadConfig, execution_type: str = "normal",
+                 save_curl_path: Optional[str] = None):
         self.config = config
         self.execution_type = execution_type
+        self.save_curl_path = save_curl_path
         self.shutdown_signal = None
         self._shutdown_event = asyncio.Event()
         WeReadApplication._instance = self
@@ -3158,12 +3233,16 @@ class WeReadApplication:
             raise RuntimeError("应用程序实例未初始化")
 
         cls.reset_run_summary()
+        cls._curl_exports = {}
 
         # 检查是否配置了多用户模式
         if instance.config.users:
             result = await cls._run_multi_user_sessions(instance)
         else:
             result = await cls._run_single_user_session(instance)
+        save_curl_path = getattr(instance, "save_curl_path", None)
+        if save_curl_path:
+            save_curl_exports(instance.config, cls._curl_exports, save_curl_path)
         cls.set_run_summary(result.to_summary_dict())
         persist_run_history(
             instance.config,
@@ -3220,8 +3299,24 @@ class WeReadApplication:
                 WeReadApplication._current_session_managers.discard(
                     session_manager
                 )
+                cls._record_curl_export("default", session_manager)
             CURRENT_SESSION_ID.reset(session_token)
             CURRENT_USER.reset(user_token)
+
+    @classmethod
+    def _record_curl_export(
+        cls, user_name: str, session_manager: "WeReadSessionManager"
+    ) -> None:
+        """记录会话结束时的 CURL，供 --save-curl 回写"""
+        try:
+            cls._curl_exports[user_name] = (
+                session_manager.export_curl_command(),
+                session_manager.cookie_renewed,
+            )
+        except Exception as e:
+            logging.warning(
+                format_error_message(f"⚠️ 用户 {user_name} 导出 CURL 失败", e)
+            )
 
     @classmethod
     async def _run_multi_user_sessions(cls, instance) -> RunResult:
@@ -3295,6 +3390,9 @@ class WeReadApplication:
                     if session_manager is not None:
                         WeReadApplication._current_session_managers.discard(
                             session_manager
+                        )
+                        cls._record_curl_export(
+                            user_config.name, session_manager
                         )
                     CURRENT_SESSION_ID.reset(session_token)
                     CURRENT_USER.reset(user_token)
@@ -3423,6 +3521,8 @@ class WeReadSessionManager:
         self.data = self.DEFAULT_DATA.copy()
         self.session_user_agent = None  # 会话级别的User-Agent
         self._last_read_error_category = None
+        self.cookie_renewed = False
+        self._curl_payload_keys: Set[str] = set()
 
         self._load_curl_config()
         self._initialize_session_user_agent()
@@ -3511,6 +3611,8 @@ class WeReadSessionManager:
                 self.headers, self.cookies, curl_data = (
                     CurlParser.parse_curl_command(curl_content)
                 )
+                # 会话中 User-Agent 可能被轮换，导出时使用原始 headers
+                self._curl_headers = dict(self.headers)
 
                 # 验证CURL配置的合法性
                 is_valid, validation_errors = CurlParser.validate_curl_headers(
@@ -3638,6 +3740,7 @@ class WeReadSessionManager:
             key: value for key, value in curl_data.items()
             if key in reusable_fields
         })
+        self._curl_payload_keys = set(curl_data) & reusable_fields
         self._validate_and_log_user_identity()
 
         missing_fields = [field for field in ("b", "c") if not curl_data.get(field)]
@@ -3798,7 +3901,9 @@ class WeReadSessionManager:
                     )
                     break
 
-                if self.behavior_simulator.should_take_break():
+                if self.behavior_simulator.should_take_break(
+                    self.session_stats.actual_duration_seconds
+                ):
                     break_duration = self.behavior_simulator.get_break_duration()
                     logging.info(f"☕ 休息一下... {break_duration} 秒")
                     completed = await interruptible_sleep(
@@ -3814,6 +3919,19 @@ class WeReadSessionManager:
                         break
                     self.session_stats.breaks_taken += 1
                     self.session_stats.total_break_time += break_duration
+                    # 休息时间不计入 rt：回来后先读一页再上报
+                    last_time = int(time.time())
+                    interval = self.behavior_simulator.get_reading_interval(
+                        self.effective_reading_config.reading_interval
+                    )
+                    if not await interruptible_sleep(interval, is_cancelled):
+                        result = SessionResult(
+                            SessionStatus.CANCELLED,
+                            self.session_stats,
+                            message="等待期间收到关闭信号",
+                        )
+                        break
+                    refresh_duration()
                     continue
 
                 try:
@@ -4069,6 +4187,7 @@ class WeReadSessionManager:
                 continue
 
             self.cookies['wr_skey'] = new_skey
+            self.cookie_renewed = True
             logging.info(
                 "✅ Cookie刷新成功，ql=%s，新密钥: %s",
                 ql_value,
@@ -4083,6 +4202,23 @@ class WeReadSessionManager:
             )
         )
         return False
+
+    def export_curl_command(self) -> str:
+        """导出当前 Cookie、身份字段和阅读位置，格式与浏览器 CURL 一致"""
+        payload = {
+            key: self.data[key]
+            for key in ("appId", "co", "sm", "pr", "ps", "pc")
+            if key in self._curl_payload_keys and key in self.data
+        }
+        book_id = self.reading_manager.current_book_id
+        chapter_id = self.reading_manager.current_chapter_id
+        if book_id and chapter_id:
+            payload["b"] = book_id
+            payload["c"] = chapter_id
+            if self.reading_manager.current_chapter_ci is not None:
+                payload["ci"] = self.reading_manager.current_chapter_ci
+        headers = getattr(self, "_curl_headers", self.headers)
+        return build_curl_command(headers, self.cookies, payload)
 
     async def _fix_no_synckey(self):
         """修复synckey问题
@@ -4206,6 +4342,22 @@ def encode_weread_id(value: str) -> str:
     return result + hashlib.md5(result.encode("utf-8")).hexdigest()[:3]
 
 
+def build_curl_command(
+    headers: Dict[str, str],
+    cookies: Dict[str, str],
+    payload: Dict[str, Any],
+) -> str:
+    """生成 CurlParser 可解析的阅读接口 CURL"""
+    lines = [f"curl '{WeReadSessionManager.READ_URL}'"]
+    lines.extend(f"-H '{key}: {value}'" for key, value in headers.items())
+    cookie_header = "; ".join(f"{key}={value}" for key, value in cookies.items())
+    lines.append(f"-H 'cookie: {cookie_header}'")
+    # 单引号会截断 --data-raw，用 JSON 转义代替
+    data = json.dumps(payload, separators=(",", ":")).replace("'", "\\u0027")
+    lines.append(f"--data-raw '{data}'")
+    return " \\\n  ".join(lines)
+
+
 def build_login_curl_command(credentials: QrLoginCredentials) -> str:
     """把扫码结果写成与浏览器抓包同格式的 CURL，复用现有解析流程"""
     cookies = {
@@ -4218,25 +4370,21 @@ def build_login_curl_command(credentials: QrLoginCredentials) -> str:
             credentials.refresh_token, safe=""
         )
     cookies["wr_ql"] = "0"
-    cookie_header = "; ".join(f"{key}={value}" for key, value in cookies.items())
 
+    headers = {
+        "accept": "application/json, text/plain, */*",
+        "content-type": "application/json;charset=UTF-8",
+        "origin": WEREAD_BASE_URL,
+        "referer": f"{WEREAD_BASE_URL}/",
+        "user-agent": credentials.user_agent,
+    }
     # 不写入 b/c，阅读位置回退到 reading.books
     payload = {
         "appId": generate_web_app_id(credentials.user_agent),
         "ps": encode_weread_id("0"),
         "pc": encode_weread_id("0"),
     }
-    lines = [
-        f"curl '{WeReadSessionManager.READ_URL}'",
-        "-H 'accept: application/json, text/plain, */*'",
-        "-H 'content-type: application/json;charset=UTF-8'",
-        f"-H 'origin: {WEREAD_BASE_URL}'",
-        f"-H 'referer: {WEREAD_BASE_URL}/'",
-        f"-H 'user-agent: {credentials.user_agent}'",
-        f"-H 'cookie: {cookie_header}'",
-        f"--data-raw '{json.dumps(payload, separators=(',', ':'))}'",
-    ]
-    return " \\\n  ".join(lines)
+    return build_curl_command(headers, cookies, payload)
 
 
 def resolve_login_output_path(
@@ -4266,12 +4414,48 @@ def resolve_login_output_path(
     return Path(config.curl_file_path or DEFAULT_LOGIN_CURL_FILE)
 
 
-def write_login_curl_file(path: Path, content: str) -> None:
+def write_curl_file(path: Path, content: str) -> None:
     """写入 CURL 文件，新建时仅允许当前用户读写"""
     path.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as file:
         file.write(content + "\n")
+
+
+def save_curl_exports(
+    config: WeReadConfig,
+    exports: Dict[str, Tuple[str, bool]],
+    path: Union[str, Path],
+) -> bool:
+    """按用户顺序写回会话结束时的 CURL，段与段之间空两行，与 WEREAD_CURL_STRING 一致"""
+    if not any(renewed for _, renewed in exports.values()):
+        logging.warning("⚠️ 没有用户成功刷新 Cookie，未写入 %s", path)
+        return False
+
+    if config.users:
+        sources = [
+            (user.name, user.file_path, user.content) for user in config.users
+        ]
+    else:
+        sources = [("default", config.curl_file_path, config.curl_content)]
+
+    segments = []
+    for name, file_path, content in sources:
+        if name in exports:
+            segments.append(exports[name][0])
+            continue
+        # 未建立会话的用户保留原始 CURL，避免回写时丢失
+        original = load_curl_source(file_path, content, name)
+        if original:
+            segments.append(original)
+
+    write_curl_file(Path(path), "\n\n\n".join(segments))
+    renewed_users = [name for name, (_, renewed) in exports.items() if renewed]
+    logging.info(
+        "💾 已写入 %d 段 CURL 到 %s，刷新成功的用户: %s",
+        len(segments), path, ", ".join(renewed_users),
+    )
+    return True
 
 
 def show_login_qr(confirm_url: str) -> None:
@@ -4433,7 +4617,7 @@ async def run_qr_login(
             await client.aclose()
 
     credentials = credentials_from_login_result(login_result, fingerprint)
-    write_login_curl_file(output_path, build_login_curl_command(credentials))
+    write_curl_file(output_path, build_login_curl_command(credentials))
     logging.info(
         "✅ 扫码登录成功，账号 %s 的认证信息已写入 %s",
         _secret_marker(credentials.vid),
@@ -5150,6 +5334,13 @@ def parse_arguments(argv: Optional[List[str]] = None):
         help="扫码登录结果的保存路径，优先于 --login-user 和 curl_config.file_path"
     )
 
+    parser.add_argument(
+        "--save-curl",
+        metavar="PATH",
+        help="每轮会话结束后把刷新后的 Cookie 和阅读位置写成 CURL，"
+             "格式同 WEREAD_CURL_STRING，供下次运行使用"
+    )
+
     args = parser.parse_args(argv)
     if (args.login_user or args.login_output) and not args.login:
         parser.error("--login-user 和 --login-output 需要配合 --login 使用")
@@ -5321,7 +5512,11 @@ async def main() -> int:
 
         # 创建并运行应用程序
         run_started = True
-        app = WeReadApplication(config, execution_type=execution_mode)
+        app = WeReadApplication(
+            config,
+            execution_type=execution_mode,
+            save_curl_path=args.save_curl,
+        )
         run_result = await app.run()
         run_summary = run_result.to_summary_dict()
         logging.info(

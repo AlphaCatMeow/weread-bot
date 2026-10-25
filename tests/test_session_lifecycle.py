@@ -5,7 +5,7 @@ from tests.helpers import FakeClock, FakeHttpClient, load_weread_bot
 
 
 class FakeBehavior:
-    def should_take_break(self):
+    def should_take_break(self, _elapsed=0):
         return False
 
     def get_reading_interval(self, _value):
@@ -105,6 +105,42 @@ class SessionLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result.status, self.bot.SessionStatus.FAILED)
         self.assertEqual(result.stats.successful_reads, 0)
+
+    async def test_break_time_is_excluded_from_next_report(self):
+        clock = FakeClock()
+        manager = self._manager([], clock, target="10")
+        breaks = [True, False]
+
+        class BreakOnce(FakeBehavior):
+            def should_take_break(self, _elapsed=0):
+                return breaks.pop(0) if breaks else False
+
+            def get_break_duration(self):
+                return 300
+
+        manager.behavior_simulator = BreakOnce()
+        seen_last_times = []
+        fake_now = [1_000_000.0]
+
+        async def simulate(last_time):
+            seen_last_times.append(last_time)
+            clock.advance(601)
+            return True, 0.01
+
+        async def sleeping(seconds, is_cancelled):
+            clock.advance(max(float(seconds), 0.01))
+            fake_now[0] += float(seconds)
+            return True
+
+        manager._simulate_reading_request = simulate
+        self.bot.interruptible_sleep = sleeping
+        with unittest.mock.patch.object(
+            self.bot.time, "time", side_effect=lambda: fake_now[0]
+        ):
+            await manager.start_reading_session()
+
+        # 休息结束时重置起点，300 秒休息不计入 rt
+        self.assertEqual(seen_last_times[0], int(1_000_000 + 300))
 
     async def test_shutdown_is_cancelled_without_success_notification(self):
         clock = FakeClock()

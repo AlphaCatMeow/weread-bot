@@ -84,6 +84,7 @@ class ApplicationResultTests(unittest.IsolatedAsyncioTestCase):
             login=False,
             login_user=None,
             login_output=None,
+            save_curl=None,
         )
         fake_app = unittest.mock.MagicMock()
         fake_app.run = AsyncMock(
@@ -121,6 +122,7 @@ class ApplicationResultTests(unittest.IsolatedAsyncioTestCase):
             login=False,
             login_user=None,
             login_output=None,
+            save_curl=None,
         )
         fake_app = unittest.mock.MagicMock()
         fake_app.run = AsyncMock(side_effect=KeyboardInterrupt)
@@ -154,6 +156,7 @@ class ApplicationResultTests(unittest.IsolatedAsyncioTestCase):
             login=False,
             login_user=None,
             login_output=None,
+            save_curl=None,
         )
         notification_service = unittest.mock.MagicMock()
         notification_service.send_notification_async = AsyncMock()

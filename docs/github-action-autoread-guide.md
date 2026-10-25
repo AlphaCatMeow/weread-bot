@@ -25,7 +25,51 @@ Fork 完成后，需要在你的仓库中配置必要的环境变量：
 
 | Secret 名称 | 说明 | 获取方法 |
 |------------|------|----------|
-| `WEREAD_CURL_STRING` | 微信读书的 cURL 请求字符串 | 参考主文档的"获取 cURL 字符串"章节 |
+| `WEREAD_CURL_STRING` | 微信读书的 cURL 请求字符串 | 本地执行 `python weread-bot.py --login --login-output ./scan.txt` 扫码生成，或参考主文档"获取 cURL 字符串"章节抓包 |
+| `GH_PAT` | 用于回写 Cookie 和记录每日计划的 Personal Access Token | 见下方"每日多次阅读与 Cookie 自动回写" |
+
+#### 每日多次阅读与 Cookie 自动回写
+
+workflow 每小时触发一次，由 `plan` 任务按北京时间决定本次是否阅读：
+
+- 每天随机确定目标次数（默认 4-8 次），只在阅读窗口（默认 07:30-23:00）内开始；
+- 两次阅读之间至少间隔 `MIN_GAP_MINUTES` 分钟（默认 45）；
+- 按剩余次数和剩余时间计算本次阅读的概率，开始时间随机分布；
+- 每次阅读时长默认 30-60 分钟，开始前再随机等待 1-15 分钟；
+- GitHub 定时任务经常延迟数小时，计划按实际运行时间判断，不依赖 cron 准时。
+
+每次运行开始时会刷新 Cookie。刷新后的 Cookie 只在内存中，如果不写回 Secret，几天后 Secret 中的旧 Cookie 就会失效。配置 `GH_PAT` 后，workflow 会：
+
+1. 用 `--save-curl` 把刷新后的 Cookie 和阅读位置写到临时文件（不进入日志和 artifact）；
+2. 用 `gh secret set` 回写 `WEREAD_CURL_STRING`；
+3. 在仓库变量 `READ_PLAN` 中记录当天的目标次数、完成次数和上次结束时间。
+
+创建 `GH_PAT`：GitHub → Settings → Developer settings → Personal access tokens → **Fine-grained tokens** → Generate new token：
+
+- Repository access 选 **Only select repositories**，只选你 Fork 的仓库；
+- Repository permissions：**Secrets** 设为 Read and write，**Variables** 设为 Read and write；
+- 生成后保存为仓库 Secret `GH_PAT`。
+
+未配置 `GH_PAT` 时，workflow 改为按概率触发（不记录次数），Cookie 也不会回写。
+
+在 **Secrets and variables → Actions → Variables** 中可以配置（均为可选）：
+
+| Variable 名称 | 说明 | 默认值 |
+|--------------|------|------|
+| `WEREAD_BOOKS` | 书籍列表，JSON，结构同 `reading.books`。扫码生成的 cURL 不含书籍，必须配置 | 无 |
+| `DAILY_RUNS` | 每天阅读次数范围 | `4-8` |
+| `READING_WINDOW` | 允许开始阅读的北京时间段 | `07:30-23:00` |
+| `MIN_GAP_MINUTES` | 两次阅读的最小间隔（分钟） | `45` |
+| `TARGET_DURATION` | 每次阅读时长（分钟），优先于同名 Secret | `30-60` |
+| `READ_PLAN` | 由 workflow 自动维护，无需手动创建 | - |
+
+`WEREAD_BOOKS` 示例（书籍和章节 ID 取自网页阅读页 URL 或抓包 cURL 中的 `b`、`c` 字段）：
+
+```json
+[{"name": "明朝那些事", "book_id": "a57325c05c8ed3a57224187", "chapters": [{"chapter_id": "a87322c014a87ff679a21ea", "chapter_index": 4}]}]
+```
+
+Cookie 回写后，cURL 中会带上最近一次的阅读位置，后续运行从该位置继续。
 
 #### 多用户
 
@@ -46,7 +90,7 @@ curl 'https://weread.qq.com/web/book/read' -H 'cookie: wr_skey=user2; ...' --dat
 
 | Secret 名称 | 说明 | 默认值 |
 |------------|------|------|
-| `TARGET_DURATION` | 默认阅读时长，格式如 `5-10`；用于定时触发或手动触发留空时的默认值 | 1-2 |
+| `TARGET_DURATION` | 默认阅读时长，格式如 `30-60`；同名 Variable 优先 | 30-60 |
 | `MAX_CONCURRENT_USERS` | 多用户并发数量（>=1） | 1 |
 | `MAX_CONSECUTIVE_FAILURES` | 单个用户连续阅读失败上限，达到后结束该会话 | 5 |
 | `HACK_COOKIE_REFRESH_QL` | Cookie 刷新首选 `ql` 值，失败时自动尝试其他兼容形式 | false |
@@ -179,23 +223,17 @@ curl 'https://weread.qq.com/web/book/read' -H 'cookie: wr_skey=user2; ...' --dat
 1. 在 **Actions** 页面，选择 **Auto Reading Bot** workflow
 2. 点击 **Run workflow** 按钮
 3. 配置运行参数：
-   - **阅读时长**: 格式为 `60-90`，表示随机 60-90 分钟；留空时优先使用仓库 Secret `TARGET_DURATION`，否则默认 `1-2`
+   - **阅读时长**: 格式为 `60-90`，表示随机 60-90 分钟；留空时依次使用 Variable / Secret `TARGET_DURATION`，否则默认 `30-60`
    - **阅读模式**: 选择阅读策略
    - **启用通知**: 是否发送完成通知
    - **启用执行历史**: 是否在运行后保存最近执行记录
    - **历史保留条数**: 最近执行记录最多保留多少条
 
-#### 定时触发（可选）
+手动触发不受每日计划限制，会立即阅读，并计入当天完成次数。
 
-Fork 后默认不会自动定时运行，因为仓库中的 `.github/workflows/auto-reading.yml` 仍然把 `schedule` 注释掉了。若希望自动定时运行，必须先取消该注释，再按需要调整 cron 表达式：
+#### 定时触发
 
-```yaml
-on:
-  # 取消注释以下行启用定时触发
-  schedule:
-    - cron: '0 0 * * *'    # UTC 00:00 = 北京时间 08:00
-    - cron: '0 12 * * *'   # UTC 12:00 = 北京时间 20:00
-```
+workflow 已启用每小时一次的定时触发（`17 * * * *`），实际是否阅读由 `plan` 任务决定，见上方"每日多次阅读与 Cookie 自动回写"。不阅读的触发约 30 秒结束。`plan` 任务每次都会调用接口保持定时任务启用，避免仓库 60 天无活动后被 GitHub 停用。
 
 ## ⚙️ 配置参数说明
 
@@ -211,14 +249,14 @@ on:
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `target_duration` | 留空 | 手动触发时可直接填写；留空则优先使用 Secret `TARGET_DURATION`，否则回退到 `1-2` |
+| `target_duration` | 留空 | 手动触发时可直接填写；留空则依次使用 Variable / Secret `TARGET_DURATION`，否则回退到 `30-60` |
 | `reading_mode` | `smart_random` | 阅读模式 |
 | `notify_enabled` | `true` | 是否启用通知 |
 | `notify_only_on_failure` | `false` | 仅失败时发送通知 |
 | `history_enabled` | `true` | 是否启用执行历史持久化 |
 | `history_max_entries` | `50` | 执行历史最多保留多少条 |
 
-当在 GitHub Actions 中手动触发 `auto-reading.yml` 时，可以直接在界面填写 `target_duration` 覆盖本次阅读时长；若留空，则 workflow 会优先读取仓库 Secret `TARGET_DURATION`，再回退到默认值 `1-2`。这对 fork 后不想改 workflow 代码、但想给定时任务设置默认时长的场景尤其有用。
+当在 GitHub Actions 中手动触发 `auto-reading.yml` 时，可以直接在界面填写 `target_duration` 覆盖本次阅读时长；若留空，则 workflow 会依次读取仓库 Variable、Secret `TARGET_DURATION`，再回退到默认值 `30-60`。这对 fork 后不想改 workflow 代码、但想给定时任务设置默认时长的场景尤其有用。
 
 同时，你也可以直接在界面勾选以上两个通知开关：`notify_enabled` 控制是否生成阅读成功摘要，`notify_only_on_failure` 则对应 `config.yaml` 中的 `notification.only_on_failure`，会自动关闭 `session_success` 和 `multi_user_summary` 两类成功事件，仅保留失败/异常通知。
 
@@ -235,9 +273,11 @@ on:
 ```yaml
 human_simulation:
   enabled: true
-  reading_speed_variation: true
-  break_probability: 0.15        # 休息概率
-  break_duration: "30-180"       # 休息时长范围
+  reading_speed_variation: true  # 每次会话随机整体速度，并缓慢漂移
+  break_probability: 0.04        # 每页休息概率（连续 8 页内不重复休息，读得越久越容易休息）
+  break_duration: "30-300"       # 休息时长范围，多数偏短
+  skim_probability: 0.08         # 每页开始连续快速翻 2-4 页的概率
+  long_read_probability: 0.06    # 每页停留较久的概率
   rotate_user_agent: false       # 是否轮换 User-Agent
 
 network:
@@ -258,7 +298,7 @@ history:
 ### 查看运行日志与历史
 
 1. 在 **Actions** 页面选择具体的运行记录
-2. 点击 **auto-reading** job
+2. 点击 **plan** job 查看本次是否阅读及原因；阅读时点击 **read** job
 3. 展开 **Run WeRead Bot** 步骤查看详细日志
 4. 在页面底部 **Artifacts** 区域下载 `weread-runtime-<run_id>`，查看 `logs/weread.log` 和 `logs/run-history.json`
 
@@ -266,7 +306,8 @@ history:
 
 - ✅ **成功**: 阅读任务正常完成
 - ❌ **失败**: 检查错误日志，通常是配置问题
-- ⏸️ **取消**: 手动取消或超时（2小时）
+- ⏸️ **取消**: 手动取消或超时（read 任务 100 分钟）
+- ⏭️ **read 任务跳过**: 本次触发按计划不阅读，属于正常情况
 
 程序退出码如下：
 
@@ -288,8 +329,9 @@ A: 检查以下几点：
 ### Q: 如何更新 cURL 字符串？
 
 A: 
-1. 重新从微信读书网页版获取 cURL 字符串
+1. 本地执行 `python weread-bot.py --login --login-output ./scan.txt` 扫码，或重新从网页版抓包
 2. 在仓库 Settings → Secrets 中更新 `WEREAD_CURL_STRING`
+3. 配置了 `GH_PAT` 时，之后每次运行会自动回写刷新后的 Cookie，通常无需再手动更新
 
 ### Q: 可以同时运行多个 Action 吗？
 
@@ -297,11 +339,11 @@ A: 不建议同时运行多个相同账户的 Action，可能导致账户异常�
 
 ### Q: GitHub Actions 有使用限制吗？
 
-A: 是的，GitHub 免费账户每月有 2000 分钟的 Actions 使用时间。本项目单次运行通常消耗 60-120 分钟。
+A: 公开仓库使用标准 runner 不计分钟数；私有仓库的免费额度为每月 2000 分钟。按默认每天 4-8 次、每次 30-60 分钟计算，每月约 5000-12000 分钟，私有仓库会超出额度，请保持 Fork 为公开仓库。公开仓库的运行日志和 artifact 任何人可见，日志已脱敏，但书名和阅读时间可见。
 
-### Q: 如何设置定时运行？
+### Q: 如何调整每天的运行次数和时间？
 
-A: 先取消 `.github/workflows/auto-reading.yml` 中 `schedule` 部分的注释，并根据需要调整 cron 表达式。注意时间为 UTC 时间。如果你 fork 后不想继续改代码，但想调整默认阅读时长，可以额外配置仓库 Secret `TARGET_DURATION`，例如 `5-10`。
+A: 修改仓库 Variables `DAILY_RUNS`、`READING_WINDOW`、`MIN_GAP_MINUTES`、`TARGET_DURATION`，无需改 workflow。阅读窗口内约有 15 次小时触发，`DAILY_RUNS` 上限超过 8 时不一定能达到。
 
 ### Q: GitHub Actions 里的执行历史保存在哪里？
 
@@ -311,8 +353,9 @@ A: 当前 workflow 会在任务结束后上传 artifact，默认包含 `logs/wer
 
 A: 程序会按首选值、相反值和省略 `ql` 的顺序自动尝试。三种形式均失败时：
 1. 检查网络连接和 Action 日志中的认证错误
-2. 重新登录微信读书并获取最新 cURL
+2. 本地扫码（`--login`）或重新抓包获取最新 cURL
 3. 更新 `WEREAD_CURL_STRING` 后重新运行 Action
+4. 未配置 `GH_PAT` 时 Cookie 不会回写，Secret 中的 Cookie 通常几天后失效
 
 ### Q: 如何判断是否需要调整 Hack 配置？
 

@@ -105,7 +105,7 @@ class LoginCurlTests(unittest.TestCase):
         bot = self.bot
         with tempfile.TemporaryDirectory() as temp_dir:
             path = Path(temp_dir) / "curl.txt"
-            bot.write_login_curl_file(
+            bot.write_curl_file(
                 path, bot.build_login_curl_command(_credentials(bot))
             )
             config = bot.WeReadConfig(

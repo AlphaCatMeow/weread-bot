@@ -2,19 +2,14 @@ name: Auto Reading Bot
 
 on:
   schedule:
-    - cron: '0 0 * * *'    # 北京时间 08:00
-    - cron: '0 2 * * *'    # 北京时间 10:00
-    - cron: '0 4 * * *'    # 北京时间 12:00
-    - cron: '0 6 * * *'    # 北京时间 14:00
-    - cron: '0 8 * * *'    # 北京时间 16:00
-    - cron: '0 10 * * *'   # 北京时间 18:00
-    - cron: '0 12 * * *'   # 北京时间 20:00
-    - cron: '0 14 * * *'   # 北京时间 22:00
+    # 每小时触发一次（非整点，整点触发最容易被 GitHub 延迟或丢弃）。
+    # 是否真正阅读由 plan 任务按北京时间、当日目标次数和最小间隔决定。
+    - cron: '17 * * * *'
 
   workflow_dispatch:
     inputs:
       target_duration:
-        description: '阅读时长（分钟，格式：55-65）'
+        description: '阅读时长（分钟，格式：30-60）'
         required: false
         default: ''
         type: string
@@ -48,10 +43,112 @@ on:
         default: '50'
         type: string
 
+# 同一时间只运行一个，避免两次阅读重叠
+concurrency:
+  group: auto-reading
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: write
+
 jobs:
-  auto-reading:
+  plan:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 5
+    outputs:
+      run: ${{ steps.decide.outputs.run }}
+    steps:
+      - name: Keep schedule enabled
+        # GitHub 会停用 60 天无活动仓库的定时任务，定期调用 enable 可避免
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api -X PUT "repos/${GITHUB_REPOSITORY}/actions/workflows/auto-reading.yml/enable" \
+            || echo "::warning::启用定时任务失败，可忽略"
+
+      - name: Decide whether to read
+        id: decide
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+          HAS_PAT: ${{ secrets.GH_PAT != '' }}
+          EVENT_NAME: ${{ github.event_name }}
+          DAILY_RUNS: ${{ vars.DAILY_RUNS || '4-8' }}
+          READING_WINDOW: ${{ vars.READING_WINDOW || '07:30-23:00' }}
+          MIN_GAP_MINUTES: ${{ vars.MIN_GAP_MINUTES || '45' }}
+        run: |
+          if [ "$HAS_PAT" = "true" ]; then
+            export READ_PLAN="$(gh variable get READ_PLAN --repo "$GITHUB_REPOSITORY" 2>/dev/null || true)"
+          else
+            echo "::warning::未配置 GH_PAT，无法记录每日计划和回写 Cookie，改为按概率触发"
+          fi
+          python3 - <<'EOF'
+          import json, os, random
+          from datetime import datetime, timedelta
+          from zoneinfo import ZoneInfo
+
+          def out(run, reason):
+              print(f"决定: {'阅读' if run else '跳过'}，原因: {reason}")
+              with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+                  f.write(f"run={'true' if run else 'false'}\n")
+
+          now = datetime.now(ZoneInfo("Asia/Shanghai"))
+          low, high = (int(x) for x in os.environ["DAILY_RUNS"].split("-"))
+          start_s, end_s = os.environ["READING_WINDOW"].split("-")
+          day = now.replace(second=0, microsecond=0)
+          win_start = day.replace(hour=int(start_s[:2]), minute=int(start_s[3:]))
+          win_end = day.replace(hour=int(end_s[:2]), minute=int(end_s[3:]))
+          gap = timedelta(minutes=int(os.environ["MIN_GAP_MINUTES"]))
+          print(f"北京时间 {now:%Y-%m-%d %H:%M}，窗口 {start_s}-{end_s}，每日 {low}-{high} 次")
+
+          if os.environ["EVENT_NAME"] == "workflow_dispatch":
+              out(True, "手动触发")
+              raise SystemExit
+          if not (win_start <= now <= win_end):
+              out(False, "不在阅读时间窗口内")
+              raise SystemExit
+
+          # 剩余小时触发次数（每小时一次）
+          triggers_left = max(1.0, (win_end - now).total_seconds() / 3600)
+          if os.environ["HAS_PAT"] != "true":
+              chance = ((low + high) / 2) / max(1.0, (win_end - win_start).total_seconds() / 3600)
+              out(random.random() < chance, f"无状态模式，概率 {chance:.2f}")
+              raise SystemExit
+
+          try:
+              state = json.loads(os.environ.get("READ_PLAN") or "{}")
+          except json.JSONDecodeError:
+              state = {}
+          if state.get("date") != now.date().isoformat():
+              state = {"date": now.date().isoformat(), "target": random.randint(low, high),
+                       "done": 0, "last_end": state.get("last_end", 0)}
+              print(f"新的一天，今日目标 {state['target']} 次")
+              # 立即保存，避免当天后续触发重新抽取目标
+              with open("new_plan.json", "w") as f:
+                  json.dump(state, f, separators=(",", ":"))
+          remaining = state["target"] - state["done"]
+          print(f"今日已完成 {state['done']}/{state['target']} 次")
+          if remaining <= 0:
+              out(False, "今日目标已完成")
+              raise SystemExit
+          since_last = now.timestamp() - float(state.get("last_end") or 0)
+          if since_last < gap.total_seconds():
+              out(False, f"距上次结束仅 {since_last / 60:.0f} 分钟")
+              raise SystemExit
+
+          # 一次阅读（约 50 分钟）加最小间隔约占 1.8 个小时触发；按剩余容量计算概率
+          chance = min(1.0, remaining * 1.8 / triggers_left)
+          out(random.random() < chance, f"剩余 {remaining} 次 / 约 {triggers_left:.1f} 个触发，概率 {chance:.2f}")
+          EOF
+          if [ -f new_plan.json ]; then
+            gh variable set READ_PLAN --repo "$GITHUB_REPOSITORY" --body "$(cat new_plan.json)"
+          fi
+
+  read:
+    needs: plan
+    if: needs.plan.outputs.run == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 100
 
     steps:
       - name: Checkout code
@@ -71,17 +168,9 @@ jobs:
         env:
           INPUT_TARGET_DURATION: ${{ github.event.inputs.target_duration }}
           SECRET_TARGET_DURATION: ${{ secrets.TARGET_DURATION }}
+          VAR_TARGET_DURATION: ${{ vars.TARGET_DURATION }}
         run: |
-          target_duration="${INPUT_TARGET_DURATION}"
-
-          if [ -z "$target_duration" ]; then
-            target_duration="${SECRET_TARGET_DURATION}"
-          fi
-
-          if [ -z "$target_duration" ]; then
-            target_duration="55-65"
-          fi
-
+          target_duration="${INPUT_TARGET_DURATION:-${VAR_TARGET_DURATION:-${SECRET_TARGET_DURATION:-30-60}}}"
           echo "TARGET_DURATION=$target_duration" >> "$GITHUB_ENV"
 
       - name: Create config file
@@ -90,12 +179,12 @@ jobs:
           app:
             name: "WeReadBot-GitHub-Action"
             startup_mode: "immediate"
-            startup_delay: "60-300"
+            startup_delay: "60-900"
 
           reading:
             mode: "${{ github.event.inputs.reading_mode || 'smart_random' }}"
             target_duration: "${TARGET_DURATION}"
-            reading_interval: "35-60"
+            reading_interval: "25-55"
             use_curl_data_first: true
             fallback_to_config: true
             smart_random:
@@ -106,8 +195,10 @@ jobs:
           human_simulation:
             enabled: true
             reading_speed_variation: true
-            break_probability: 0.15
-            break_duration: "20-90"
+            break_probability: 0.04
+            break_duration: "30-300"
+            skim_probability: 0.08
+            long_read_probability: 0.06
             rotate_user_agent: false
 
           network:
@@ -146,11 +237,14 @@ jobs:
         run: mkdir -p logs
 
       - name: Run WeRead Bot
+        id: bot
         env:
           # Cookie刷新QL属性，根据不同用户的环境，可能需要设置为True或False来确保cookie刷新正常工作，默认值为false
           HACK_COOKIE_REFRESH_QL: ${{ secrets.HACK_COOKIE_REFRESH_QL }}
           # 多用户 cURL：在 WEREAD_CURL_STRING 中放置多段 curl，段与段之间至少插入两个空行
           WEREAD_CURL_STRING: ${{ secrets.WEREAD_CURL_STRING }}
+          # 书籍列表（JSON，结构同 reading.books），扫码生成的 cURL 不含书籍时必须配置
+          WEREAD_BOOKS: ${{ vars.WEREAD_BOOKS }}
           # 多用户并发控制，未设置默认 1（顺序执行）
           MAX_CONCURRENT_USERS: ${{ secrets.MAX_CONCURRENT_USERS || 1 }}
           # 单用户连续阅读失败上限，未设置时默认 5
@@ -199,14 +293,59 @@ jobs:
           echo "运行参数:"
           echo "- 阅读时长: ${TARGET_DURATION}"
           echo "- 阅读模式: ${{ github.event.inputs.reading_mode || 'smart_random' }}"
-          echo "- 启用通知: ${{ github.event.inputs.notify_enabled != 'false' }}"
-          echo "- 仅失败通知: ${{ github.event.inputs.notify_only_on_failure == 'true' }}"
-          echo "- 历史持久化: ${{ github.event.inputs.history_enabled != 'false' }}"
-          echo "- 历史保留条数: ${{ github.event.inputs.history_max_entries || '50' }}"
           echo "================================"
 
-          # 运行阅读机器人
-          python weread-bot.py --config config.yaml
+          # 刷新后的 Cookie 写到 RUNNER_TEMP，不进入 logs/ 和 artifact
+          python weread-bot.py --config config.yaml --save-curl "$RUNNER_TEMP/weread-curl.txt"
+
+      - name: Save renewed cookie to secret
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          # 只有 Cookie 刷新成功时 --save-curl 才会生成文件
+          if [ ! -f "$RUNNER_TEMP/weread-curl.txt" ]; then
+            echo "本次没有可回写的 Cookie"
+          elif [ -z "$GH_TOKEN" ]; then
+            echo "::warning::未配置 GH_PAT，刷新后的 Cookie 未回写，Secret 中的 Cookie 过几天会失效"
+          else
+            gh secret set WEREAD_CURL_STRING --repo "$GITHUB_REPOSITORY" < "$RUNNER_TEMP/weread-curl.txt"
+            echo "已回写 WEREAD_CURL_STRING"
+          fi
+          rm -f "$RUNNER_TEMP/weread-curl.txt"
+
+      - name: Update daily plan
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+          BOT_OUTCOME: ${{ steps.bot.outcome }}
+          DAILY_RUNS: ${{ vars.DAILY_RUNS || '4-8' }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            exit 0
+          fi
+          export READ_PLAN="$(gh variable get READ_PLAN --repo "$GITHUB_REPOSITORY" 2>/dev/null || true)"
+          plan="$(python3 - <<'EOF'
+          import json, os, random, time
+          from datetime import datetime
+          from zoneinfo import ZoneInfo
+
+          today = datetime.now(ZoneInfo("Asia/Shanghai")).date().isoformat()
+          try:
+              state = json.loads(os.environ.get("READ_PLAN") or "{}")
+          except json.JSONDecodeError:
+              state = {}
+          if state.get("date") != today:
+              low, high = (int(x) for x in os.environ["DAILY_RUNS"].split("-"))
+              state = {"date": today, "target": random.randint(low, high), "done": 0}
+          if os.environ["BOT_OUTCOME"] == "success":
+              state["done"] = int(state.get("done", 0)) + 1
+          state["last_end"] = int(time.time())
+          print(json.dumps(state, separators=(",", ":")))
+          EOF
+          )"
+          echo "今日计划: $plan"
+          gh variable set READ_PLAN --repo "$GITHUB_REPOSITORY" --body "$plan"
 
       - name: Upload runtime artifacts
         if: always()
