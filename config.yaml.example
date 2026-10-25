@@ -14,13 +14,13 @@ app:
 # CURL 配置（支持单用户和多用户模式）
 curl_config:
   # 单用户模式：从文件读取 CURL bash 命令。多用户模式下此项无效；若同时配置单用户与多用户，优先多用户。
-  file_path: "curl_command.txt"   # 示例：curl_command.txt、./cookies/me.txt（浏览器复制为 cURL 后保存）
+  file_path: "curl_command.txt"   # 示例：curl_command.txt、./cookies/me.txt（浏览器复制为 cURL 后保存，或用 --login 扫码生成）
 
   # 多用户模式（优先级高于单用户配置）
   users:
     # 用户1：必填 name（用于日志与通知区分）、file_path（该用户的 CURL 命令文件路径）
     - name: "user1"                    # 示例：任意昵称，如 "张三"、"account_1"
-      file_path: "user1_curl.txt"      # 示例：相对或绝对路径，如 "./curl/user1.txt"
+      file_path: "user1_curl.txt"      # 示例：相对或绝对路径，如 "./curl/user1.txt"；--login --login-user user1 扫码写入此文件
       cookie_refresh_ql: true          # 是否对该用户启用 Cookie 刷新时使用 ql 属性（默认 false，遇刷新失败可试 true）
       # 可选：用户特定的阅读参数覆盖
       reading_overrides:

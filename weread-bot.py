@@ -81,6 +81,11 @@ try:
     from croniter import croniter
 except ImportError:
     croniter = None
+
+try:
+    import qrcode
+except ImportError:
+    qrcode = None
 from zoneinfo import ZoneInfo
 
 VERSION = "0.3.9"
@@ -1601,10 +1606,8 @@ async def interruptible_sleep(
 
 
 def is_successful_read_response(response_data: Dict[str, Any]) -> bool:
-    """仅接受同时包含真值 succ 和非空 synckey 的响应。"""
-    return bool(response_data.get("succ")) and bool(
-        response_data.get("synckey")
-    )
+    """succ 为真即视为成功；当前接口常只返回 {succ: 1}，不带 synckey。"""
+    return bool(response_data.get("succ"))
 
 
 def load_curl_source(
@@ -3687,17 +3690,13 @@ class WeReadSessionManager:
                 "阅读请求成功，响应字段: %s",
                 ", ".join(sorted(response_data.keys())),
             )
-            return True, response_time
-
-        if response_data.get('succ'):
-            logging.warning(
-                self._build_protocol_warning(
-                    "阅读响应缺少 synckey",
-                    f"book={self.data.get('b')}, chapter={self.data.get('c')}",
+            if not response_data.get('synckey'):
+                logging.debug(
+                    "阅读响应缺少 synckey，调用 chapterInfos 修复: "
+                    f"book={self.data.get('b')}, chapter={self.data.get('c')}"
                 )
-            )
-            await self._fix_no_synckey()
-            return False, response_time
+                await self._fix_no_synckey()
+            return True, response_time
 
         logging.warning(
             self._build_protocol_warning(
@@ -4132,6 +4131,303 @@ class WeReadSessionManager:
             _19094e -= 2
 
         return hex(_7032f5 + _cc1055)[2:].lower()
+
+
+# ======================
+# 扫码登录
+# ======================
+
+WEREAD_BASE_URL = "https://weread.qq.com"
+LOGIN_REFERER_URL = f"{WEREAD_BASE_URL}/r/weread-skills"
+LOGIN_UID_URL = f"{WEREAD_BASE_URL}/api/auth/getLoginUid"
+LOGIN_INFO_URL = f"{WEREAD_BASE_URL}/api/auth/getLoginInfo"
+LOGIN_CONFIRM_URL = f"{WEREAD_BASE_URL}/web/confirm"
+LOGIN_TIMEOUT_SECONDS = 300
+LOGIN_POLL_TIMEOUT_SECONDS = 70
+LOGIN_POLL_INTERVAL_SECONDS = 2.0
+DEFAULT_LOGIN_CURL_FILE = "curl_command.txt"
+LOGIN_USER_AGENT = UserAgentRotator.USER_AGENTS[0]
+
+
+class QrLoginError(RuntimeError):
+    """扫码登录失败"""
+
+
+@dataclass
+class QrLoginCredentials:
+    """扫码登录得到的认证信息"""
+    vid: str
+    skey: str
+    refresh_token: str
+    fingerprint: str
+    user_agent: str = LOGIN_USER_AGENT
+
+
+def generate_web_app_id(user_agent: str) -> str:
+    """按网页前端规则从 User-Agent 推导 appId"""
+    prefix = "".join(
+        str(len(part) % 10) for part in user_agent.split(" ")[:12]
+    )
+    number = 0
+    for char in user_agent:
+        number = (131 * number + ord(char)) & 0x7FFFFFFF
+    return f"wb{prefix}h{str(number)[:16]}"
+
+
+def encode_weread_id(value: str) -> str:
+    """网页前端的标识编码 _e()，用于 b/c/ps/pc 等字段"""
+    digest = hashlib.md5(value.encode("utf-8")).hexdigest()
+    if re.fullmatch(r"[0-9]+", value):
+        kind = "3"
+        chunks = [
+            format(int(value[i:i + 9]), "x")
+            for i in range(0, len(value), 9)
+        ]
+    else:
+        kind = "4"
+        chunks = ["".join(format(ord(char), "x") for char in value)]
+
+    result = digest[:3] + kind + "2" + digest[-2:]
+    result += "g".join(f"{len(chunk):02x}{chunk}" for chunk in chunks)
+    if len(result) < 20:
+        result += digest[:20 - len(result)]
+    return result + hashlib.md5(result.encode("utf-8")).hexdigest()[:3]
+
+
+def build_login_curl_command(credentials: QrLoginCredentials) -> str:
+    """把扫码结果写成与浏览器抓包同格式的 CURL，复用现有解析流程"""
+    cookies = {
+        "wr_fp": credentials.fingerprint,
+        "wr_vid": credentials.vid,
+        "wr_skey": credentials.skey,
+    }
+    if credentials.refresh_token:
+        cookies["wr_rt"] = urllib.parse.quote(
+            credentials.refresh_token, safe=""
+        )
+    cookies["wr_ql"] = "0"
+    cookie_header = "; ".join(f"{key}={value}" for key, value in cookies.items())
+
+    # 不写入 b/c，阅读位置回退到 reading.books
+    payload = {
+        "appId": generate_web_app_id(credentials.user_agent),
+        "ps": encode_weread_id("0"),
+        "pc": encode_weread_id("0"),
+    }
+    lines = [
+        f"curl '{WeReadSessionManager.READ_URL}'",
+        "-H 'accept: application/json, text/plain, */*'",
+        "-H 'content-type: application/json;charset=UTF-8'",
+        f"-H 'origin: {WEREAD_BASE_URL}'",
+        f"-H 'referer: {WEREAD_BASE_URL}/'",
+        f"-H 'user-agent: {credentials.user_agent}'",
+        f"-H 'cookie: {cookie_header}'",
+        f"--data-raw '{json.dumps(payload, separators=(',', ':'))}'",
+    ]
+    return " \\\n  ".join(lines)
+
+
+def resolve_login_output_path(
+    config: WeReadConfig,
+    user_name: Optional[str] = None,
+    output: Optional[str] = None,
+) -> Path:
+    """确定扫码结果写入的 CURL 文件路径"""
+    if output:
+        return Path(output)
+    if user_name:
+        for user_config in config.users:
+            if user_config.name != user_name:
+                continue
+            if user_config.file_path:
+                return Path(user_config.file_path)
+            raise QrLoginError(
+                f"用户 {user_name} 未配置 file_path，"
+                f"请用 --login-output 指定保存路径"
+            )
+        raise QrLoginError(f"curl_config.users 中没有名为 {user_name} 的用户")
+    if config.users:
+        raise QrLoginError(
+            "已配置多用户，请用 --login-user 指定要登录的用户，"
+            "或用 --login-output 指定保存路径"
+        )
+    return Path(config.curl_file_path or DEFAULT_LOGIN_CURL_FILE)
+
+
+def write_login_curl_file(path: Path, content: str) -> None:
+    """写入 CURL 文件，新建时仅允许当前用户读写"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as file:
+        file.write(content + "\n")
+
+
+def show_login_qr(confirm_url: str) -> None:
+    """在终端显示扫码二维码和链接"""
+    if qrcode is None:
+        logging.warning(
+            "⚠️ 未安装 qrcode，无法在终端显示二维码 (pip install qrcode)，"
+            "请把下方链接转成二维码后用微信扫码"
+        )
+    else:
+        qr = qrcode.QRCode(border=1)
+        qr.add_data(confirm_url)
+        qr.make(fit=True)
+        try:
+            qr.print_ascii(invert=True)
+        except UnicodeEncodeError:
+            logging.warning("⚠️ 当前终端编码无法显示二维码，请使用下方链接")
+    # 直接输出链接：日志脱敏会把 URL 中的 "ps:" 误判为敏感字段
+    print(f"扫码链接: {confirm_url}", flush=True)
+
+
+def _login_response_json(response: Any, stage: str) -> Dict[str, Any]:
+    """解析登录接口响应"""
+    if response.status_code != 200:
+        raise QrLoginError(f"{stage} 返回 HTTP {response.status_code}")
+    try:
+        data = response.json()
+    except ValueError as exc:
+        raise QrLoginError(f"{stage} 返回的不是 JSON") from exc
+    if not isinstance(data, dict):
+        raise QrLoginError(f"{stage} 返回的不是 JSON 对象")
+    return data
+
+
+async def request_login_uid(client: Any) -> str:
+    """建立临时会话并获取扫码登录 uid"""
+    page = await client.get(
+        LOGIN_REFERER_URL, headers={"Referer": f"{WEREAD_BASE_URL}/"}
+    )
+    if page.status_code >= 400:
+        raise QrLoginError(f"登录页面返回 HTTP {page.status_code}")
+    data = _login_response_json(
+        await client.get(LOGIN_UID_URL, headers={"Referer": LOGIN_REFERER_URL}),
+        "getLoginUid",
+    )
+    uid = data.get("uid")
+    if not isinstance(uid, str) or not uid:
+        raise QrLoginError("getLoginUid 未返回有效 uid")
+    return uid
+
+
+async def _read_login_otp(otp_reader: Callable[[str], str]) -> str:
+    """读取手机上显示的 4 位验证码"""
+    while True:
+        try:
+            otp = await asyncio.to_thread(
+                otp_reader, "请输入手机上显示的 4 位验证码: "
+            )
+        except EOFError as exc:
+            raise QrLoginError("需要输入验证码，但当前环境无法交互输入") from exc
+        otp = str(otp).strip()
+        if len(otp) == 4 and otp.isdigit():
+            return otp
+        logging.warning("⚠️ 验证码应为 4 位数字")
+
+
+async def wait_for_qr_login(
+    client: Any,
+    uid: str,
+    otp_reader: Callable[[str], str] = input,
+    timeout_seconds: float = LOGIN_TIMEOUT_SECONDS,
+    poll_interval: float = LOGIN_POLL_INTERVAL_SECONDS,
+) -> Dict[str, Any]:
+    """长轮询 getLoginInfo，直到用户在手机上确认登录"""
+    deadline = time.monotonic() + timeout_seconds
+    otp = ""
+    while time.monotonic() < deadline:
+        try:
+            response = await client.get(
+                LOGIN_INFO_URL,
+                params={"uid": uid, "otp": otp},
+                headers={"Referer": LOGIN_REFERER_URL},
+                timeout=LOGIN_POLL_TIMEOUT_SECONDS,
+            )
+        except httpx.TimeoutException:
+            continue
+        data = _login_response_json(response, "getLoginInfo")
+        if data.get("succeed") is True:
+            return data
+
+        logic_code = str(data.get("logicCode") or "")
+        if logic_code in ("NEED_OTP", "OTP_NOT_MATCH"):
+            if logic_code == "OTP_NOT_MATCH":
+                logging.warning("⚠️ 验证码不匹配，请重新输入")
+            otp = await _read_login_otp(otp_reader)
+            continue
+        if logic_code in ("LOGIN_TIMEOUT", "OTP_EXPIRED"):
+            raise QrLoginError(f"扫码登录已失效: {logic_code}，请重新执行 --login")
+        if logic_code or "errCode" in data or "errcode" in data:
+            raise QrLoginError(
+                f"扫码登录返回未知状态: "
+                f"{logic_code or data.get('errCode', data.get('errcode'))}"
+            )
+        await asyncio.sleep(poll_interval)
+
+    raise QrLoginError(f"{timeout_seconds:.0f} 秒内未完成扫码，请重新执行 --login")
+
+
+def credentials_from_login_result(
+    login_result: Dict[str, Any], fingerprint: str
+) -> QrLoginCredentials:
+    """从 getLoginInfo 成功响应提取认证信息"""
+    vid = str(login_result.get("webLoginVid") or "")
+    skey = str(login_result.get("accessToken") or "")
+    if not vid or not skey:
+        raise QrLoginError("登录响应缺少 webLoginVid 或 accessToken")
+    return QrLoginCredentials(
+        vid=vid,
+        skey=skey,
+        refresh_token=str(login_result.get("refreshToken") or ""),
+        fingerprint=fingerprint,
+    )
+
+
+async def run_qr_login(
+    config: WeReadConfig,
+    user_name: Optional[str] = None,
+    output: Optional[str] = None,
+    otp_reader: Callable[[str], str] = input,
+    client: Any = None,
+) -> Path:
+    """扫码登录并把认证信息写入 CURL 文件"""
+    output_path = resolve_login_output_path(config, user_name, output)
+    fingerprint = str(random.SystemRandom().getrandbits(32))
+    owns_client = client is None
+    if owns_client:
+        client = httpx.AsyncClient(
+            headers={
+                "User-Agent": LOGIN_USER_AGENT,
+                "Accept": "application/json, text/plain, */*",
+            },
+            timeout=config.network.timeout,
+        )
+    # 每次登录使用独立设备指纹，避免多个会话互相顶替
+    client.cookies.set(
+        "wr_fp", fingerprint, domain=".weread.qq.com", path="/"
+    )
+
+    try:
+        uid = await request_login_uid(client)
+        confirm_url = (
+            f"{LOGIN_CONFIRM_URL}?uid={urllib.parse.quote(uid, safe='')}"
+        )
+        logging.info("📱 请使用微信扫描二维码并在手机上确认登录")
+        show_login_qr(confirm_url)
+        login_result = await wait_for_qr_login(client, uid, otp_reader)
+    finally:
+        if owns_client:
+            await client.aclose()
+
+    credentials = credentials_from_login_result(login_result, fingerprint)
+    write_login_curl_file(output_path, build_login_curl_command(credentials))
+    logging.info(
+        "✅ 扫码登录成功，账号 %s 的认证信息已写入 %s",
+        _secret_marker(credentials.vid),
+        output_path,
+    )
+    return output_path
 
 
 # ======================
@@ -4784,6 +5080,7 @@ def parse_arguments(argv: Optional[List[str]] = None):
   python weread-bot.py                    # 立即执行
   python weread-bot.py --mode scheduled   # 定时执行
   python weread-bot.py --mode daemon      # 守护进程模式
+  python weread-bot.py --login            # 微信扫码登录，生成CURL文件
         """
     )
 
@@ -4823,7 +5120,28 @@ def parse_arguments(argv: Optional[List[str]] = None):
         help="显示最近一次真实执行结果并退出"
     )
 
-    return parser.parse_args(argv)
+    parser.add_argument(
+        "--login",
+        action="store_true",
+        help="微信扫码登录，把认证信息写入 CURL 文件后退出"
+    )
+
+    parser.add_argument(
+        "--login-user",
+        metavar="NAME",
+        help="扫码登录的目标用户，写入 curl_config.users 中该用户的 file_path"
+    )
+
+    parser.add_argument(
+        "--login-output",
+        metavar="PATH",
+        help="扫码登录结果的保存路径，优先于 --login-user 和 curl_config.file_path"
+    )
+
+    args = parser.parse_args(argv)
+    if (args.login_user or args.login_output) and not args.login:
+        parser.error("--login-user 和 --login-output 需要配合 --login 使用")
+    return args
 
 
 async def _validate_curl_configs(config: WeReadConfig) -> None:
@@ -4919,10 +5237,14 @@ async def main() -> int:
         execution_mode = "validate-config"
     elif args.show_last_run:
         execution_mode = "show-last-run"
+    elif args.login:
+        execution_mode = "login"
 
     required_deps = []
     if Path(args.config).exists() and yaml is None:
         required_deps.append("PyYAML")
+    if execution_mode == "login" and httpx is None:
+        required_deps.append("httpx")
     if execution_mode == "normal":
         if requests is None:
             required_deps.append("requests")
@@ -4953,6 +5275,10 @@ async def main() -> int:
 
         # 使用配置设置日志
         setup_logging(config.logging, verbose=args.verbose)
+
+        if args.login:
+            await run_qr_login(config, args.login_user, args.login_output)
+            return 0
 
         # 命令行参数覆盖配置文件
         if args.mode:

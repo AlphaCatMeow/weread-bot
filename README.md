@@ -35,7 +35,7 @@ WeRead Bot 是一个易用的微信读书自动阅读机器人，通过模拟真
 
 ## 首次使用建议
 
-- 先准备一份可用的微信读书 cURL 请求，再开始配置
+- 先准备一份可用的微信读书 cURL 请求，再开始配置；也可以用 `--login` 扫码生成，见[扫码登录（免抓包）](#扫码登录免抓包)
 - 初次运行建议先执行 `--validate-config` 和 `--dry-run`
 - 如果你的系统没有 `python` 命令，请把文档中的 `python` 替换为 `python3`
 
@@ -172,6 +172,9 @@ python weread-bot.py --dry-run --config config.yaml
 # 查看最近一次真实执行结果
 python weread-bot.py --show-last-run --config config.yaml
 
+# 微信扫码登录，生成 CURL 文件
+python weread-bot.py --login --config config.yaml
+
 # 查看所有可用命令
 python weread-bot.py --help
 ```
@@ -181,6 +184,7 @@ python weread-bot.py --help
 - `--validate-config` 会输出用户数量、用户级 `CURL` 来源、时间策略覆盖情况和全局/用户配置差异摘要。
 - `--dry-run` 会在 `--validate-config` 的基础上继续输出通知触发配置、通道就绪状态、缺失字段和禁用通道摘要，但不会真正发起阅读请求。
 - `--show-last-run` 只读取 `history.file` 指向的本地历史文件，输出最近一次真实执行摘要后退出，不会初始化阅读会话。
+- `--login` 扫码登录后把认证信息写入 CURL 文件并退出，详见[扫码登录（免抓包）](#扫码登录免抓包)。
 - 真实执行结束后，如 `history.enabled=true`，程序会把最近执行摘要写入默认文件 `logs/run-history.json`。
 - 历史记录只保存时间、状态、用户数、阅读统计和失败分类等摘要，不会保存 Cookie、请求头或原始 CURL。
 - 如果 `curl_config.users[].reading_overrides` 中存在不支持的键，程序会直接提示对应配置路径。
@@ -706,6 +710,27 @@ reading:
 ```
 
 ## 抓包配置详解
+
+### 扫码登录（免抓包）
+
+在能看到终端的机器上执行，用微信扫码并在手机上确认，程序会把认证信息写成 CURL 文件：
+
+```bash
+# 单用户：写入 curl_config.file_path（未配置时为 curl_command.txt）
+python weread-bot.py --login --config config.yaml
+
+# 多用户：写入 curl_config.users 中 user1 的 file_path
+python weread-bot.py --login --login-user user1 --config config.yaml
+
+# 指定保存路径
+python weread-bot.py --login --login-output ./cookies/me.txt
+```
+
+- 终端显示二维码需要 `qrcode`（已列入 `requirements.txt`）；未安装时只输出扫码链接，可自行转成二维码。
+- 手机提示输入验证码时，在终端输入手机上显示的 4 位数字。
+- 5 分钟内未完成确认会退出，重新执行即可。
+- 文件中不含书籍和章节，阅读位置使用 `reading.books`。文件包含 Cookie，不要提交或分享。
+- 生成的文件与抓包得到的 CURL 用法相同，可以直接用于 GitHub Actions、Docker 或青龙面板。
 
 ### 获取CURL命令步骤
 

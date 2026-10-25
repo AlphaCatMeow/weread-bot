@@ -44,6 +44,7 @@
   - `python3 weread-bot.py --validate-config --config config.yaml`
   - `python3 weread-bot.py --dry-run --config config.yaml`
   - `python3 weread-bot.py --show-last-run --config config.yaml`
+  - `python3 weread-bot.py --login --config config.yaml`（扫码生成 CURL 文件）
 
 ## 当前文档列表
 

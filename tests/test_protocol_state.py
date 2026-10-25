@@ -30,13 +30,15 @@ class ProtocolStateTests(unittest.IsolatedAsyncioTestCase):
             ],
         )
 
-    def test_only_truthy_succ_and_synckey_is_success(self):
+    def test_truthy_succ_is_success_with_or_without_synckey(self):
         cases = [
             ({"succ": True, "synckey": "key"}, True),
+            ({"succ": 1}, True),
+            ({"succ": True, "synckey": ""}, True),
             ({"succ": False, "synckey": "key"}, False),
             ({"succ": 0, "synckey": "key"}, False),
             ({"synckey": "key"}, False),
-            ({"succ": True, "synckey": ""}, False),
+            ({}, False),
         ]
         for payload, expected in cases:
             with self.subTest(payload=payload):
@@ -90,6 +92,33 @@ class ProtocolStateTests(unittest.IsolatedAsyncioTestCase):
         session._prepare_read_payload(1)
 
         self.assertNotIn("ci", session.data)
+
+    async def test_succ_without_synckey_counts_and_still_fixes(self):
+        session = object.__new__(self.bot.WeReadSessionManager)
+        session.data = {"b": "book", "c": "chapter"}
+        session.user_name = "alice"
+        session._fix_no_synckey = AsyncMock()
+        session._refresh_cookie = AsyncMock()
+
+        self.assertEqual(
+            await session._handle_protocol_response({"succ": 1}, 0.5),
+            (True, 0.5),
+        )
+        session._fix_no_synckey.assert_awaited_once()
+
+        session._fix_no_synckey.reset_mock()
+        self.assertEqual(
+            await session._handle_protocol_response(
+                {"succ": 1, "synckey": 7}, 0.5
+            ),
+            (True, 0.5),
+        )
+        session._fix_no_synckey.assert_not_awaited()
+
+        self.assertEqual(
+            await session._handle_protocol_response({}, 0.5), (False, 0.5)
+        )
+        session._refresh_cookie.assert_awaited_once()
 
     async def test_synckey_fix_uses_current_book(self):
         session = object.__new__(self.bot.WeReadSessionManager)

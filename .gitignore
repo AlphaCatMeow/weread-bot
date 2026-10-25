@@ -223,3 +223,8 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# 含 Cookie 的 CURL 文件
+curl_command.txt
+*_curl.txt
+scan_test.txt
