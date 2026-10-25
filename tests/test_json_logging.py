@@ -40,8 +40,11 @@ class JsonLoggingTests(unittest.TestCase):
                 )
             )
             logging.info('中文 "quoted"\nline')
-            for handler in logging.getLogger().handlers:
-                handler.flush()
+            root_logger = logging.getLogger()
+            # Windows 不允许删除仍被打开的日志文件，清理临时目录前先关闭
+            for handler in root_logger.handlers[:]:
+                handler.close()
+                root_logger.removeHandler(handler)
 
             lines = log_path.read_text(encoding="utf-8").splitlines()
 
