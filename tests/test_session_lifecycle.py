@@ -106,6 +106,26 @@ class SessionLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.status, self.bot.SessionStatus.FAILED)
         self.assertEqual(result.stats.successful_reads, 0)
 
+    async def test_reported_rt_accumulates_only_for_successful_reads(self):
+        clock = FakeClock()
+
+        def read(success):
+            def outcome():
+                clock.advance(20)
+                return success, 0.01
+            return outcome
+
+        manager = self._manager(
+            [read(True), read(False), read(True)], clock, target="1"
+        )
+        manager.data = {"rt": 30}
+
+        result = await manager.start_reading_session()
+
+        self.assertEqual(result.stats.reported_read_seconds, 60)
+        summary = self.bot.RunResult.from_session_results([result])
+        self.assertEqual(summary.to_summary_dict()["total_reported_read_seconds"], 60)
+
     async def test_break_time_is_excluded_from_next_report(self):
         clock = FakeClock()
         manager = self._manager([], clock, target="10")

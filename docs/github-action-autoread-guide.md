@@ -30,19 +30,19 @@ Fork 完成后，需要在你的仓库中配置必要的环境变量：
 
 #### 每日多次阅读与 Cookie 自动回写
 
-workflow 每小时触发一次，由 `plan` 任务按北京时间决定本次是否阅读：
+workflow 每小时触发三次，由 `plan` 任务按北京时间决定本次是否阅读、读多久：
 
-- 每天随机确定目标次数（默认 4-8 次），只在阅读窗口（默认 07:30-23:00）内开始；
-- 两次阅读之间至少间隔 `MIN_GAP_MINUTES` 分钟（默认 45）；
-- 按剩余次数和剩余时间计算本次阅读的概率，开始时间随机分布；
-- 每次阅读时长默认 30-60 分钟，开始前再随机等待 1-15 分钟；
-- GitHub 定时任务经常延迟数小时，计划按实际运行时间判断，不依赖 cron 准时。
+- 每天随机确定目标阅读时长（默认 240-360 分钟，即 4-6 小时），只在阅读窗口（默认 07:30-23:00）内开始；
+- 每次阅读时长按当日剩余时长和剩余机会计算，默认 45-150 分钟，每天通常 3-5 次，最多 `MAX_DAILY_RUNS` 次；
+- 两次阅读之间至少间隔 `MIN_GAP_MINUTES` 分钟（默认 45），开始前再随机等待 1-10 分钟；
+- 计入的时长取自本次成功上报的 `rt` 之和（服务端计入的阅读时长），不含开始前等待和休息；
+- GitHub 经常延迟或丢弃定时触发。`plan` 会记录最近的触发时间估算实际间隔，触发稀疏时每次触发都读，并拉长单次时长；不阅读的触发约 10 秒结束。
 
 每次运行开始时会刷新 Cookie。刷新后的 Cookie 只在内存中，如果不写回 Secret，几天后 Secret 中的旧 Cookie 就会失效。配置 `GH_PAT` 后，workflow 会：
 
 1. 用 `--save-curl` 把刷新后的 Cookie 和阅读位置写到临时文件（不进入日志和 artifact）；
 2. 用 `gh secret set` 回写 `WEREAD_CURL_STRING`；
-3. 在仓库变量 `READ_PLAN` 中记录当天的目标次数、完成次数和上次结束时间。
+3. 在仓库变量 `READ_PLAN` 中记录当天的目标时长、已读时长、阅读次数、上次结束时间和最近的触发时间。
 
 创建 `GH_PAT`：GitHub → Settings → Developer settings → Personal access tokens → **Fine-grained tokens** → Generate new token：
 
@@ -57,10 +57,11 @@ workflow 每小时触发一次，由 `plan` 任务按北京时间决定本次是
 | Variable 名称 | 说明 | 默认值 |
 |--------------|------|------|
 | `WEREAD_BOOKS` | 书籍列表，JSON，结构同 `reading.books`。扫码生成的 cURL 不含书籍，必须配置 | 无 |
-| `DAILY_RUNS` | 每天阅读次数范围 | `4-8` |
+| `DAILY_MINUTES` | 每天阅读总时长范围（分钟） | `240-360` |
+| `SESSION_MINUTES` | 单次阅读时长范围（分钟） | `45-150` |
+| `MAX_DAILY_RUNS` | 每天最多阅读次数 | `8` |
 | `READING_WINDOW` | 允许开始阅读的北京时间段 | `07:30-23:00` |
 | `MIN_GAP_MINUTES` | 两次阅读的最小间隔（分钟） | `45` |
-| `TARGET_DURATION` | 每次阅读时长（分钟），优先于同名 Secret | `30-60` |
 | `READ_PLAN` | 由 workflow 自动维护，无需手动创建 | - |
 
 `WEREAD_BOOKS` 示例（书籍和章节 ID 取自网页阅读页 URL 或抓包 cURL 中的 `b`、`c` 字段）：
@@ -90,7 +91,6 @@ curl 'https://weread.qq.com/web/book/read' -H 'cookie: wr_skey=user2; ...' --dat
 
 | Secret 名称 | 说明 | 默认值 |
 |------------|------|------|
-| `TARGET_DURATION` | 默认阅读时长，格式如 `30-60`；同名 Variable 优先 | 30-60 |
 | `MAX_CONCURRENT_USERS` | 多用户并发数量（>=1） | 1 |
 | `MAX_CONSECUTIVE_FAILURES` | 单个用户连续阅读失败上限，达到后结束该会话 | 5 |
 | `HACK_COOKIE_REFRESH_QL` | Cookie 刷新首选 `ql` 值，失败时自动尝试其他兼容形式 | false |
@@ -223,7 +223,7 @@ curl 'https://weread.qq.com/web/book/read' -H 'cookie: wr_skey=user2; ...' --dat
 1. 在 **Actions** 页面，选择 **Auto Reading Bot** workflow
 2. 点击 **Run workflow** 按钮
 3. 配置运行参数：
-   - **阅读时长**: 格式为 `60-90`，表示随机 60-90 分钟；留空时依次使用 Variable / Secret `TARGET_DURATION`，否则默认 `30-60`
+   - **阅读时长**: 格式为 `60-90`，表示随机 60-90 分钟；留空时使用 `plan` 按当日剩余时长计算的值
    - **阅读模式**: 选择阅读策略
    - **启用通知**: 是否发送完成通知
    - **启用执行历史**: 是否在运行后保存最近执行记录
@@ -233,7 +233,7 @@ curl 'https://weread.qq.com/web/book/read' -H 'cookie: wr_skey=user2; ...' --dat
 
 #### 定时触发
 
-workflow 已启用每小时一次的定时触发（`17 * * * *`），实际是否阅读由 `plan` 任务决定，见上方"每日多次阅读与 Cookie 自动回写"。不阅读的触发约 30 秒结束。`plan` 任务每次都会调用接口保持定时任务启用，避免仓库 60 天无活动后被 GitHub 停用。
+workflow 已启用每小时三次的定时触发（`7,27,47 * * * *`），实际是否阅读、读多久由 `plan` 任务决定，见上方"每日多次阅读与 Cookie 自动回写"。不阅读的触发约 10 秒结束。`plan` 任务每次都会调用接口保持定时任务启用，避免仓库 60 天无活动后被 GitHub 停用。
 
 ## ⚙️ 配置参数说明
 
@@ -249,14 +249,14 @@ workflow 已启用每小时一次的定时触发（`17 * * * *`），实际是�
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `target_duration` | 留空 | 手动触发时可直接填写；留空则依次使用 Variable / Secret `TARGET_DURATION`，否则回退到 `30-60` |
+| `target_duration` | 留空 | 手动触发时可直接填写；留空则使用 `plan` 按当日剩余时长计算的值 |
 | `reading_mode` | `smart_random` | 阅读模式 |
 | `notify_enabled` | `true` | 是否启用通知 |
 | `notify_only_on_failure` | `false` | 仅失败时发送通知 |
 | `history_enabled` | `true` | 是否启用执行历史持久化 |
 | `history_max_entries` | `50` | 执行历史最多保留多少条 |
 
-当在 GitHub Actions 中手动触发 `auto-reading.yml` 时，可以直接在界面填写 `target_duration` 覆盖本次阅读时长；若留空，则 workflow 会依次读取仓库 Variable、Secret `TARGET_DURATION`，再回退到默认值 `30-60`。这对 fork 后不想改 workflow 代码、但想给定时任务设置默认时长的场景尤其有用。
+当在 GitHub Actions 中手动触发 `auto-reading.yml` 时，可以直接在界面填写 `target_duration` 覆盖本次阅读时长；若留空，则使用 `plan` 按当日剩余时长计算的值。定时运行的时长由 `DAILY_MINUTES`、`SESSION_MINUTES` 控制，不再读取 `TARGET_DURATION`。
 
 同时，你也可以直接在界面勾选以上两个通知开关：`notify_enabled` 控制是否生成阅读成功摘要，`notify_only_on_failure` 则对应 `config.yaml` 中的 `notification.only_on_failure`，会自动关闭 `session_success` 和 `multi_user_summary` 两类成功事件，仅保留失败/异常通知。
 
@@ -306,7 +306,7 @@ history:
 
 - ✅ **成功**: 阅读任务正常完成
 - ❌ **失败**: 检查错误日志，通常是配置问题
-- ⏸️ **取消**: 手动取消或超时（read 任务 100 分钟）
+- ⏸️ **取消**: 手动取消或超时（read 任务 200 分钟）
 - ⏭️ **read 任务跳过**: 本次触发按计划不阅读，属于正常情况
 
 程序退出码如下：
@@ -339,11 +339,11 @@ A: 不建议同时运行多个相同账户的 Action，可能导致账户异常�
 
 ### Q: GitHub Actions 有使用限制吗？
 
-A: 公开仓库使用标准 runner 不计分钟数；私有仓库的免费额度为每月 2000 分钟。按默认每天 4-8 次、每次 30-60 分钟计算，每月约 5000-12000 分钟，私有仓库会超出额度，请保持 Fork 为公开仓库。公开仓库的运行日志和 artifact 任何人可见，日志已脱敏，但书名和阅读时间可见。
+A: 公开仓库使用标准 runner 不计分钟数；私有仓库的免费额度为每月 2000 分钟。按默认每天阅读 4-6 小时计算，每月约 8000-11000 分钟，私有仓库会超出额度，请保持 Fork 为公开仓库。公开仓库的运行日志和 artifact 任何人可见，日志已脱敏，但书名和阅读时间可见。
 
 ### Q: 如何调整每天的运行次数和时间？
 
-A: 修改仓库 Variables `DAILY_RUNS`、`READING_WINDOW`、`MIN_GAP_MINUTES`、`TARGET_DURATION`，无需改 workflow。阅读窗口内约有 15 次小时触发，`DAILY_RUNS` 上限超过 8 时不一定能达到。
+A: 修改仓库 Variables `DAILY_MINUTES`、`SESSION_MINUTES`、`MAX_DAILY_RUNS`、`READING_WINDOW`、`MIN_GAP_MINUTES`，无需改 workflow。`plan` 任务日志会显示当日已读分钟数、估算的触发间隔和本次决定；也可以在 Variables 中查看 `READ_PLAN`。
 
 ### Q: GitHub Actions 里的执行历史保存在哪里？
 

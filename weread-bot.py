@@ -615,6 +615,7 @@ class ReadingSession:
     chapters_read: List[str] = field(default_factory=list)
     breaks_taken: int = 0
     total_break_time: int = 0
+    reported_read_seconds: int = 0  # 成功上报的 rt 之和，即服务端计入的阅读时长
     response_times: List[float] = field(default_factory=list)
 
     @property
@@ -682,6 +683,7 @@ class RunResult:
     total_failed_reads: int = 0
     failure_categories: Dict[str, int] = field(default_factory=dict)
     continue_on_failure: bool = False
+    total_reported_read_seconds: int = 0
 
     @property
     def exit_code(self) -> int:
@@ -700,6 +702,7 @@ class RunResult:
             "total_failed_reads": self.total_failed_reads,
             "failure_categories": self.failure_categories.copy(),
             "continue_on_failure": self.continue_on_failure,
+            "total_reported_read_seconds": self.total_reported_read_seconds,
         }
 
     @classmethod
@@ -755,6 +758,9 @@ class RunResult:
             ),
             failure_categories=failure_categories,
             continue_on_failure=continue_on_failure,
+            total_reported_read_seconds=sum(
+                result.stats.reported_read_seconds for result in results
+            ),
         )
 
 
@@ -3942,6 +3948,9 @@ class WeReadSessionManager:
                     self.session_stats.response_times.append(response_time)
                     if success:
                         self.session_stats.successful_reads += 1
+                        reported_rt = getattr(self, "data", {}).get('rt')
+                        if isinstance(reported_rt, int) and reported_rt > 0:
+                            self.session_stats.reported_read_seconds += reported_rt
                         consecutive_failures = 0
                         last_failure_category = None
                         last_time = int(time.time())
@@ -4682,6 +4691,9 @@ def build_run_history_record(
         "cancelled_users": run_summary.get("cancelled_users", 0),
         "skipped_users": run_summary.get("skipped_users", 0),
         "total_duration_seconds": run_summary.get("total_duration_seconds", 0),
+        "total_reported_read_seconds": run_summary.get(
+            "total_reported_read_seconds", 0
+        ),
         "total_reads": run_summary.get("total_reads", 0),
         "total_failed_reads": run_summary.get("total_failed_reads", 0),
         "failure_categories": failure_categories,
