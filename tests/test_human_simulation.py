@@ -61,6 +61,26 @@ class HumanBehaviorSimulatorTests(unittest.TestCase):
             self.assertFalse(fresh.should_take_break(0))
             self.assertTrue(tired.should_take_break(1800))
 
+    def test_fatigue_is_capped_at_double(self):
+        # 0.1 * 2 = 0.2：读 2 小时后概率也不超过 2 倍
+        with patch.object(self.bot.random, "random", return_value=0.21):
+            simulator = self._simulator(break_probability=0.1)
+            simulator.pages_since_break = 100
+            self.assertFalse(simulator.should_take_break(7200))
+        with patch.object(self.bot.random, "random", return_value=0.19):
+            simulator = self._simulator(break_probability=0.1)
+            simulator.pages_since_break = 100
+            self.assertTrue(simulator.should_take_break(7200))
+
+    def test_breaks_are_at_least_ten_minutes_apart(self):
+        simulator = self._simulator(break_probability=1.0)
+        simulator.pages_since_break = 100
+        self.assertTrue(simulator.should_take_break(1000))
+        simulator.pages_since_break = 100
+        self.assertFalse(simulator.should_take_break(1599))
+        simulator.pages_since_break = 100
+        self.assertTrue(simulator.should_take_break(1600))
+
     def test_break_duration_skews_short(self):
         simulator = self._simulator(break_duration="30-300")
         values = [simulator.get_break_duration() for _ in range(2000)]

@@ -126,6 +126,34 @@ class SessionLifecycleTests(unittest.IsolatedAsyncioTestCase):
         summary = self.bot.RunResult.from_session_results([result])
         self.assertEqual(summary.to_summary_dict()["total_reported_read_seconds"], 60)
 
+    async def test_next_rt_starts_from_reported_ct(self):
+        clock = FakeClock()
+        manager = self._manager([], clock, target="10")
+        seen_last_times = []
+        fake_now = [1_000_000.0]
+
+        async def simulate(last_time):
+            seen_last_times.append(last_time)
+            # 上报时刻 ct 早于请求完成：模拟请求耗时和限速等待 8 秒
+            manager.data = {"ct": int(fake_now[0]), "rt": 30}
+            fake_now[0] += 8
+            clock.advance(301)
+            return True, 0.01
+
+        async def sleeping(seconds, is_cancelled):
+            clock.advance(max(float(seconds), 0.01))
+            fake_now[0] += float(seconds)
+            return True
+
+        manager._simulate_reading_request = simulate
+        self.bot.interruptible_sleep = sleeping
+        with unittest.mock.patch.object(
+            self.bot.time, "time", side_effect=lambda: fake_now[0]
+        ):
+            await manager.start_reading_session()
+
+        self.assertEqual(seen_last_times[1], 1_000_000)
+
     async def test_break_time_is_excluded_from_next_report(self):
         clock = FakeClock()
         manager = self._manager([], clock, target="10")

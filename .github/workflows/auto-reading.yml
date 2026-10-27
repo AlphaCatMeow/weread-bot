@@ -58,7 +58,8 @@ jobs:
     timeout-minutes: 5
     outputs:
       run: ${{ steps.decide.outputs.run }}
-      duration: ${{ steps.decide.outputs.duration }}
+      sessions: ${{ steps.decide.outputs.sessions }}
+      pauses: ${{ steps.decide.outputs.pauses }}
       plan_date: ${{ steps.decide.outputs.plan_date }}
     steps:
       - name: Keep schedule enabled
@@ -76,7 +77,7 @@ jobs:
           HAS_PAT: ${{ secrets.GH_PAT != '' }}
           EVENT_NAME: ${{ github.event_name }}
           DAILY_MINUTES: ${{ vars.DAILY_MINUTES || '240-360' }}
-          SESSION_MINUTES: ${{ vars.SESSION_MINUTES || '45-150' }}
+          SESSION_MINUTES: ${{ vars.SESSION_MINUTES || '60-120' }}
           MAX_DAILY_RUNS: ${{ vars.MAX_DAILY_RUNS || '8' }}
           READING_WINDOW: ${{ vars.READING_WINDOW || '07:30-23:00' }}
           MIN_GAP_MINUTES: ${{ vars.MIN_GAP_MINUTES || '45' }}
@@ -87,14 +88,16 @@ jobs:
             echo "::warning::未配置 GH_PAT，无法记录每日计划和回写 Cookie，每次触发按固定时长阅读"
           fi
           python3 - <<'EOF'
-          import json, math, os, random, statistics
-          from datetime import datetime
+          import json, os, random, statistics
+          from datetime import datetime, timedelta
           from zoneinfo import ZoneInfo
 
           def span(name):
               low, high = os.environ[name].split("-")
               return int(low), int(high)
 
+          BLOCK_LIMIT = 330  # 单个任务最长 360 分钟，留出安装和收尾时间
+          SETUP, STARTUP = 3, 6  # 安装依赖、每段开始前随机等待的平均分钟数
           now = datetime.now(ZoneInfo("Asia/Shanghai"))
           today = now.date().isoformat()
           min_low, min_high = span("DAILY_MINUTES")
@@ -106,7 +109,7 @@ jobs:
           win_start = day.replace(hour=int(start_s[:2]), minute=int(start_s[3:]))
           win_end = day.replace(hour=int(end_s[:2]), minute=int(end_s[3:]))
           print(f"北京时间 {now:%Y-%m-%d %H:%M}，窗口 {start_s}-{end_s}，"
-                f"每日 {min_low}-{min_high} 分钟，最多 {max_runs} 次")
+                f"每日 {min_low}-{min_high} 分钟，最多 {max_runs} 段")
 
           try:
               state = json.loads(os.environ.get("READ_PLAN") or "{}")
@@ -125,53 +128,95 @@ jobs:
               print(f"新的一天，今日目标 {state['target_min']} 分钟")
           diffs = [b - a for a, b in zip(state["triggers"], state["triggers"][1:])
                    if 0 < b - a < 12 * 3600]
-          interval_h = (min(6.0, max(0.25, statistics.median(diffs) / 3600))
+          interval_h = (min(8.0, max(0.25, statistics.median(diffs) / 3600))
                         if len(diffs) >= 3 else 1.0)
+          # 计入比例：成功上报的 rt 之和 / 阅读段时长，由每次运行后实测校准
+          ratio = min(1.0, max(0.5, float(state.get("ratio") or 0.75)))
 
           remaining = state["target_min"] - state["done_min"]
           runs_left = max_runs - state["runs"]
-          # 每段时长偏好取区间中点；剩余时间只够更少的触发时，拉长每段
-          preferred = (s_low + s_high) / 2
-          desired = max(1, min(runs_left, math.ceil(remaining / preferred)))
-          hours_left = max(0.0, (win_end - now).total_seconds() / 3600)
-          cycle_h = max(interval_h, (preferred + gap_min) / 60)
-          opportunities = 1 + hours_left / cycle_h
-          sessions = max(1, min(desired, math.floor(opportunities)))
-          # 开始前等待和休息不计入阅读时长，按约 92% 折算
-          duration = remaining / sessions / 0.92 * random.uniform(0.85, 1.15)
-          duration = int(min(s_high, max(s_low, duration), max(15, remaining / 0.92)))
-          print(f"今日已读 {state['done_min']:.0f}/{state['target_min']} 分钟，"
-                f"{state['runs']} 次；触发间隔约 {interval_h:.1f} 小时")
+          # 多留 10 分钟余量抵消计入波动（与每日上限保持 8 分钟距离），换算成还需要的阅读段总时长
+          aim = min(state["target_min"] + 10, min_high - 8) - state["done_min"]
+          need = max(0.0, aim) / ratio
+
+          sparse = interval_h >= 1.5
+          # 触发稀疏时 GitHub 还会继续丢触发，之后的机会打折更多
+          reliability = 0.4 if sparse else 0.7
+
+          def future_triggers(block_minutes):
+              """本次任务结束后，窗口内预计还能收到的有效触发次数"""
+              block_end = now + timedelta(minutes=block_minutes)
+              hours = max(0.0, (win_end - block_end).total_seconds() / 3600)
+              return hours / interval_h * reliability
+
+          since_last = now.timestamp() - float(state.get("last_end") or 0)
+          # 距上次结束不足最小间隔时：触发稀疏则在任务内先等够间隔再读，否则跳过本次
+          first_pause = 0
+          if since_last < gap_min * 60 and sparse:
+              first_pause = int(random.uniform(gap_min, gap_min * 1.5) - since_last / 60) + 1
+          # 触发稀疏且在窗口开始前 3 小时内：任务内等到窗口开始后再读
+          before_window = (win_start - now).total_seconds() / 60
+          if sparse and 0 < before_window <= 180:
+              first_pause = max(first_pause, int(before_window + random.uniform(0, 30)))
+
+          # 逐段安排本次任务，pauses[i] 为第 i 段开始前的等待分钟数；
+          # 直到本次覆盖的时长足够（剩余部分交给之后的触发），或达到上限
+          sessions, pauses, elapsed, covered = [], [], SETUP, 0.0
+          while len(sessions) < runs_left and covered < need - 5:
+              pause = int(random.uniform(gap_min, gap_min * 2)) if sessions else first_pause
+              seg_start = now + timedelta(minutes=elapsed + pause + STARTUP)
+              if seg_start > win_end:
+                  break
+              seg = min(random.uniform(s_low, s_high), need - covered)
+              if need - covered - seg < s_low / 2:
+                  seg = min(need - covered, s_high * 1.2)  # 剩余太少就并入本段
+              seg = max(15, int(seg))
+              if elapsed + pause + STARTUP + seg > BLOCK_LIMIT:
+                  break
+              sessions.append(seg)
+              pauses.append(pause)
+              elapsed += pause + STARTUP + seg
+              covered += seg
+              if covered >= (need - covered) / max(1e-9, future_triggers(elapsed)):
+                  break
+          print(f"今日已读 {state['done_min']:.0f}/{state['target_min']} 分钟，{state['runs']} 段；"
+                f"触发间隔约 {interval_h:.1f} 小时，计入比例 {ratio:.2f}")
 
           def finish(run, reason):
-              print(f"决定: {'阅读 ' + str(duration) + ' 分钟' if run else '跳过'}，原因: {reason}")
+              plan = (f"阅读 {len(sessions)} 段 {'+'.join(map(str, sessions))} 分钟"
+                      + (f"，各段前等待 {'+'.join(map(str, pauses))} 分钟" if any(pauses) else ""))
+              print(f"决定: {plan if run else '跳过'}，原因: {reason}")
               with open(os.environ["GITHUB_OUTPUT"], "a") as f:
                   f.write(f"run={'true' if run else 'false'}\n"
-                          f"duration={duration}\nplan_date={today}\n")
+                          f"sessions={','.join(map(str, sessions))}\n"
+                          f"pauses={','.join(map(str, pauses))}\nplan_date={today}\n")
               with open("new_plan.json", "w") as f:
                   json.dump(state, f, separators=(",", ":"))
               raise SystemExit
 
           if os.environ["EVENT_NAME"] == "workflow_dispatch":
+              sessions = sessions[:1] or [int((s_low + s_high) / 2)]
+              pauses = [0]
               finish(True, "手动触发")
           if os.environ["HAS_PAT"] != "true":
-              duration = int((s_low + s_high) / 2)
+              sessions, pauses = [int((s_low + s_high) / 2)], [0]
               chance = 5 / max(1.0, (win_end - win_start).total_seconds() / 3600)
               finish(win_start <= now <= win_end and random.random() < chance,
                      f"无状态模式，概率 {chance:.2f}")
-          if not (win_start <= now <= win_end):
-              finish(False, "不在阅读时间窗口内")
-          if remaining < 10:
+          if remaining <= 0:
               finish(False, "今日阅读时长已达标")
           if runs_left <= 0:
-              finish(False, "今日阅读次数已达上限")
-          since_last = now.timestamp() - float(state.get("last_end") or 0)
-          if since_last < gap_min * 60:
+              finish(False, "今日阅读段数已达上限")
+          first_start = now + timedelta(minutes=SETUP + (pauses[0] if pauses else 0) + STARTUP)
+          if not sessions or not (win_start <= first_start <= win_end + timedelta(minutes=STARTUP + SETUP)):
+              finish(False, "不在阅读时间窗口内")
+          if since_last < gap_min * 60 and not sparse:
               finish(False, f"距上次结束仅 {since_last / 60:.0f} 分钟")
-          # 触发稀疏时（GitHub 丢弃较多定时触发）每次都读，否则按剩余需求随机
-          chance = 1.0 if interval_h >= 1.5 else min(1.0, desired / opportunities * 1.3)
+          # 触发频繁时按剩余需求随机决定，开始时间更分散；触发稀疏时每次都读
+          later = future_triggers(elapsed)
+          chance = 1.0 if sparse else min(1.0, need / sum(sessions) / (1 + later) * 1.3)
           finish(random.random() < chance,
-                 f"还需约 {desired} 段 / 约 {opportunities:.1f} 次机会，概率 {chance:.2f}")
+                 f"还需 {need:.0f} 分钟阅读，之后约 {later:.1f} 次有效触发，概率 {chance:.2f}")
           EOF
           if [ "$HAS_PAT" = "true" ] && [ -f new_plan.json ]; then
             gh variable set READ_PLAN --repo "$GITHUB_REPOSITORY" --body "$(cat new_plan.json)"
@@ -181,8 +226,8 @@ jobs:
     needs: plan
     if: needs.plan.outputs.run == 'true'
     runs-on: ubuntu-latest
-    # 单次最长阅读 SESSION_MINUTES 上限（默认 150）+ 开始前等待 + 安装
-    timeout-minutes: 200
+    # plan 安排的多段阅读最长 330 分钟，GitHub 单个任务上限 360 分钟
+    timeout-minutes: 355
 
     steps:
       - name: Checkout code
@@ -201,11 +246,17 @@ jobs:
       - name: Resolve runtime parameters
         env:
           INPUT_TARGET_DURATION: ${{ github.event.inputs.target_duration }}
-          PLAN_DURATION: ${{ needs.plan.outputs.duration }}
+          PLAN_SESSIONS: ${{ needs.plan.outputs.sessions }}
+          PLAN_PAUSES: ${{ needs.plan.outputs.pauses }}
         run: |
-          # 手动触发时填写的时长优先，否则使用 plan 按当日剩余时长计算的值
-          target_duration="${INPUT_TARGET_DURATION:-${PLAN_DURATION:-60}}"
-          echo "TARGET_DURATION=$target_duration" >> "$GITHUB_ENV"
+          # 手动触发时填写的时长优先（单段），否则使用 plan 安排的多段时长
+          if [ -n "$INPUT_TARGET_DURATION" ]; then
+            echo "SESSIONS=$INPUT_TARGET_DURATION" >> "$GITHUB_ENV"
+            echo "PAUSES=" >> "$GITHUB_ENV"
+          else
+            echo "SESSIONS=${PLAN_SESSIONS:-60}" >> "$GITHUB_ENV"
+            echo "PAUSES=$PLAN_PAUSES" >> "$GITHUB_ENV"
+          fi
 
       - name: Create config file
         run: |
@@ -217,7 +268,7 @@ jobs:
 
           reading:
             mode: "${{ github.event.inputs.reading_mode || 'smart_random' }}"
-            target_duration: "${TARGET_DURATION}"
+            target_duration: "60"
             reading_interval: "25-55"
             use_curl_data_first: true
             fallback_to_config: true
@@ -229,8 +280,8 @@ jobs:
           human_simulation:
             enabled: true
             reading_speed_variation: true
-            break_probability: 0.04
-            break_duration: "30-300"
+            break_probability: 0.03
+            break_duration: "30-240"
             skim_probability: 0.08
             long_read_probability: 0.06
             rotate_user_agent: false
@@ -324,13 +375,46 @@ jobs:
         run: |
           echo "开始自动阅读任务..."
           echo "当前时间: $(date)"
-          echo "运行参数:"
-          echo "- 阅读时长: ${TARGET_DURATION}"
+          echo "- 阅读段（分钟）: ${SESSIONS}，各段前等待（分钟）: ${PAUSES:-0}"
           echo "- 阅读模式: ${{ github.event.inputs.reading_mode || 'smart_random' }}"
           echo "================================"
 
-          # 刷新后的 Cookie 写到 RUNNER_TEMP，不进入 logs/ 和 artifact
-          python weread-bot.py --config config.yaml --save-curl "$RUNNER_TEMP/weread-curl.txt"
+          # 记录运行前的历史条数，收尾时只统计本次新增的记录
+          python3 -c 'import json,sys
+          try: print(len(json.load(open(sys.argv[1], encoding="utf-8"))))
+          except Exception: print(0)' "$HISTORY_FILE" > "$RUNNER_TEMP/history-before"
+
+          IFS=',' read -ra session_list <<< "$SESSIONS"
+          IFS=',' read -ra pause_list <<< "$PAUSES"
+          ran_minutes=0
+          ran_sessions=0
+          status=0
+          for i in "${!session_list[@]}"; do
+            pause="${pause_list[$i]:-0}"
+            if [ "$pause" -gt 0 ]; then
+              echo "等待 ${pause} 分钟后开始下一段..."
+              sleep $(( pause * 60 ))
+            fi
+            # 使用上一段刷新后的 Cookie，写到 RUNNER_TEMP，不进入 logs/ 和 artifact
+            if [ -f "$RUNNER_TEMP/weread-curl.txt" ]; then
+              export WEREAD_CURL_STRING="$(cat "$RUNNER_TEMP/weread-curl.txt")"
+            fi
+            export TARGET_DURATION="${session_list[$i]}"
+            echo "=== 第 $((i + 1))/${#session_list[@]} 段，${TARGET_DURATION} 分钟 ==="
+            set +e
+            python weread-bot.py --config config.yaml --save-curl "$RUNNER_TEMP/weread-curl.txt"
+            status=$?
+            set -e
+            ran_minutes=$(( ran_minutes + ${session_list[$i]} ))
+            ran_sessions=$(( ran_sessions + 1 ))
+            if [ "$status" -ne 0 ]; then
+              echo "::warning::第 $((i + 1)) 段失败，退出码 $status，跳过后续阅读段"
+              break
+            fi
+          done
+          echo "RAN_MINUTES=$ran_minutes" >> "$GITHUB_ENV"
+          echo "RAN_SESSIONS=$ran_sessions" >> "$GITHUB_ENV"
+          exit "$status"
 
       - name: Save renewed cookie to secret
         if: always()
@@ -352,14 +436,13 @@ jobs:
         if: always()
         env:
           GH_TOKEN: ${{ secrets.GH_PAT }}
-          BOT_OUTCOME: ${{ steps.bot.outcome }}
           PLAN_DATE: ${{ needs.plan.outputs.plan_date }}
-          PLAN_DURATION: ${{ needs.plan.outputs.duration }}
           HISTORY_FILE: ${{ secrets.HISTORY_FILE || 'logs/run-history.json' }}
         run: |
           if [ -z "$GH_TOKEN" ]; then
             exit 0
           fi
+          export HISTORY_BEFORE="$(cat "$RUNNER_TEMP/history-before" 2>/dev/null || echo 0)"
           export READ_PLAN="$(gh variable get READ_PLAN --repo "$GITHUB_REPOSITORY" 2>/dev/null || true)"
           plan="$(python3 - <<'EOF'
           import json, os, sys, time
@@ -368,19 +451,30 @@ jobs:
               state = json.loads(os.environ.get("READ_PLAN") or "{}")
           except json.JSONDecodeError:
               state = {}
-          # 服务端计入的阅读时长 = 本次成功上报的 rt 之和，取自执行历史最后一条
+          ran_minutes = float(os.environ.get("RAN_MINUTES") or 0)
+          ran_sessions = int(os.environ.get("RAN_SESSIONS") or 0)
+          ratio = min(1.0, max(0.5, float(state.get("ratio") or 0.75)))
+          # 服务端计入的阅读时长 = 本次各段成功上报的 rt 之和，取自本次新增的执行历史
           try:
               with open(os.environ["HISTORY_FILE"], encoding="utf-8") as f:
-                  read_seconds = int(json.load(f)[-1]["total_reported_read_seconds"])
-          except (OSError, ValueError, IndexError, KeyError, TypeError):
-              # 没有执行历史时按计划时长的 90% 估算
-              success = os.environ["BOT_OUTCOME"] == "success"
-              read_seconds = int(float(os.environ.get("PLAN_DURATION") or 0) * 60 * 0.9) if success else 0
-          print(f"本次计入 {read_seconds / 60:.1f} 分钟", file=sys.stderr)
+                  records = json.load(f)[int(os.environ["HISTORY_BEFORE"]):]
+              read_seconds = sum(int(r.get("total_reported_read_seconds", 0)) for r in records)
+              measured = bool(records)
+          except (OSError, ValueError, TypeError):
+              measured = False
+          if not measured:
+              # 未启用执行历史时按当前比例估算
+              read_seconds = int(ran_minutes * 60 * ratio)
+          # 按实测比例校准，平滑避免单次波动
+          if measured and ran_minutes > 0 and read_seconds > 0:
+              observed = read_seconds / 60 / ran_minutes
+              state["ratio"] = round(min(1.0, max(0.5, ratio * 0.6 + observed * 0.4)), 3)
+          print(f"本次 {ran_sessions} 段，阅读段共 {ran_minutes:.0f} 分钟，计入 {read_seconds / 60:.1f} 分钟，"
+                f"计入比例 {state.get('ratio', ratio)}", file=sys.stderr)
           # 跨过午夜结束时，计入开始阅读那天的计划
           if state.get("date") == os.environ["PLAN_DATE"]:
               state["done_min"] = round(float(state.get("done_min", 0)) + read_seconds / 60, 1)
-              state["runs"] = int(state.get("runs", 0)) + 1
+              state["runs"] = int(state.get("runs", 0)) + ran_sessions
           state["last_end"] = int(time.time())
           print(json.dumps(state, separators=(",", ":")))
           EOF

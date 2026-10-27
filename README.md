@@ -316,7 +316,7 @@ open config-generator.html
 |--------|----------|--------|------|
 | 行为模拟 | `HUMAN_SIMULATION_ENABLED` | `false` | 是否启用人类行为模拟 |
 | 阅读速度变化 | `READING_SPEED_VARIATION` | `true` | 每次会话随机整体速度，阅读中缓慢漂移 |
-| 休息概率 | `BREAK_PROBABILITY` | `0.1` | 每页休息概率（0-1），连续 8 页内不重复休息，读得越久越高 |
+| 休息概率 | `BREAK_PROBABILITY` | `0.1` | 每页休息概率（0-1），两次休息至少间隔 8 页和 10 分钟，读满 30 分钟后翻倍（不再继续增加） |
 | 休息时长 | `BREAK_DURATION` | `10-20` | 休息时长（秒），休息时间不计入上报的阅读时长 |
 | 略读概率 | `SKIM_PROBABILITY` | `0.08` | 每页开始连续快速翻 2-4 页的概率（0-1） |
 | 细读概率 | `LONG_READ_PROBABILITY` | `0.06` | 每页停留较久的概率（0-1） |

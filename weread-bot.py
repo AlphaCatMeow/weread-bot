@@ -2383,7 +2383,9 @@ class HumanBehaviorSimulator:
 
     # 两次休息之间至少翻过的页数
     MIN_PAGES_BETWEEN_BREAKS = 8
-    # 阅读多久后休息概率翻倍（秒）
+    # 两次休息之间至少间隔的阅读时长（秒）
+    MIN_SECONDS_BETWEEN_BREAKS = 600
+    # 阅读多久后休息概率翻倍（秒），之后不再继续增加
     FATIGUE_SECONDS = 1800
 
     def __init__(self, config: HumanSimulationConfig):
@@ -2394,18 +2396,24 @@ class HumanBehaviorSimulator:
         self.speed_drift = 1.0
         self.skim_pages_left = 0
         self.pages_since_break = 0
+        self.last_break_elapsed: Optional[float] = None
 
     def should_take_break(self, elapsed_seconds: float = 0) -> bool:
-        """判断翻页前是否休息：读得越久越容易休息，刚休息过不会马上再休息"""
+        """判断翻页前是否休息：读得越久越容易休息（最多 2 倍），刚休息过不会马上再休息"""
         if not self.config.enabled:
             return False
         self.pages_since_break += 1
         if self.pages_since_break <= self.MIN_PAGES_BETWEEN_BREAKS:
             return False
-        fatigue = 1 + max(0.0, elapsed_seconds) / self.FATIGUE_SECONDS
+        elapsed = max(0.0, elapsed_seconds)
+        if (self.last_break_elapsed is not None
+                and elapsed - self.last_break_elapsed < self.MIN_SECONDS_BETWEEN_BREAKS):
+            return False
+        fatigue = 1 + min(1.0, elapsed / self.FATIGUE_SECONDS)
         if random.random() < min(1.0, self.config.break_probability * fatigue):
             self.pages_since_break = 0
             self.skim_pages_left = 0
+            self.last_break_elapsed = elapsed
             return True
         return False
 
@@ -3953,7 +3961,15 @@ class WeReadSessionManager:
                             self.session_stats.reported_read_seconds += reported_rt
                         consecutive_failures = 0
                         last_failure_category = None
-                        last_time = int(time.time())
+                        # 下次 rt 从本次上报时刻 ct 起算，请求耗时和限速等待也计入阅读时长
+                        now_ts = int(time.time())
+                        reported_ct = getattr(self, "data", {}).get('ct')
+                        last_time = (
+                            reported_ct
+                            if isinstance(reported_ct, int)
+                            and 0 <= now_ts - reported_ct <= 600
+                            else now_ts
+                        )
                         logging.info(
                             "✅ 阅读成功，进度: %s分钟 / %.2f分钟",
                             self.session_stats.actual_duration_seconds // 60,
