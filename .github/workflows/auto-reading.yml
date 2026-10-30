@@ -269,7 +269,8 @@ jobs:
           reading:
             mode: "${{ github.event.inputs.reading_mode || 'smart_random' }}"
             target_duration: "60"
-            reading_interval: "25-55"
+            # 服务端每次上报约计入 30 秒，rt 超出的部分不计，间隔保持在 30 秒附近
+            reading_interval: "28-35"
             use_curl_data_first: true
             fallback_to_config: true
             smart_random:
@@ -283,7 +284,8 @@ jobs:
             break_probability: 0.03
             break_duration: "30-240"
             skim_probability: 0.08
-            long_read_probability: 0.06
+            # 长停留的 rt 可达 80 秒以上，超出 30 秒的部分不计入
+            long_read_probability: 0
             rotate_user_agent: false
 
           network:
