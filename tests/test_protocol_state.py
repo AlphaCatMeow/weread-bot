@@ -48,11 +48,11 @@ class ProtocolStateTests(unittest.IsolatedAsyncioTestCase):
         session.cookies = {"wr_skey": "old-key"}
         return session
 
-    def test_truthy_succ_is_success_with_or_without_synckey(self):
+    def test_success_requires_truthy_succ_and_synckey(self):
         cases = [
             ({"succ": True, "synckey": "key"}, True),
-            ({"succ": 1}, True),
-            ({"succ": True, "synckey": ""}, True),
+            ({"succ": 1}, False),
+            ({"succ": True, "synckey": ""}, False),
             ({"succ": False, "synckey": "key"}, False),
             ({"succ": 0, "synckey": "key"}, False),
             ({"synckey": "key"}, False),
@@ -98,6 +98,10 @@ class ProtocolStateTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(ValueError, "阅读位置初始化失败"):
             session._apply_protocol_reading_position("book", "chapter", 1)
 
+    def test_default_payload_position_fields_are_valid_values(self):
+        data = self.bot.WeReadSessionManager.DEFAULT_DATA
+        self.assertEqual((data["co"], data["sm"], data["pr"]), (0, "", 0))
+
     def test_prepare_payload_removes_stale_ci(self):
         session = object.__new__(self.bot.WeReadSessionManager)
         session.data = self.bot.WeReadSessionManager.DEFAULT_DATA.copy()
@@ -111,7 +115,7 @@ class ProtocolStateTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertNotIn("ci", session.data)
 
-    async def test_succ_without_synckey_counts_and_still_fixes(self):
+    async def test_succ_without_synckey_fails_and_fixes(self):
         session = object.__new__(self.bot.WeReadSessionManager)
         session.data = {"b": "book", "c": "chapter"}
         session.user_name = "alice"
@@ -120,9 +124,10 @@ class ProtocolStateTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(
             await session._handle_protocol_response({"succ": 1}, 0.5),
-            (True, 0.5),
+            (False, 0.5),
         )
         session._fix_no_synckey.assert_awaited_once()
+        session._refresh_cookie.assert_not_awaited()
 
         session._fix_no_synckey.reset_mock()
         self.assertEqual(

@@ -154,6 +154,34 @@ class SessionLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(seen_last_times[1], 1_000_000)
 
+    async def test_failed_read_keeps_rt_start_for_next_report(self):
+        clock = FakeClock()
+        manager = self._manager([], clock, target="10")
+        seen_last_times = []
+        outcomes = [False, True]
+        fake_now = [1_000_000.0]
+
+        async def simulate(last_time):
+            seen_last_times.append(last_time)
+            manager.data = {"ct": int(fake_now[0]), "rt": 30}
+            clock.advance(301)
+            return (outcomes.pop(0) if outcomes else True), 0.01
+
+        async def sleeping(seconds, is_cancelled):
+            clock.advance(max(float(seconds), 0.01))
+            fake_now[0] += 30
+            return True
+
+        manager._simulate_reading_request = simulate
+        self.bot.interruptible_sleep = sleeping
+        with unittest.mock.patch.object(
+            self.bot.time, "time", side_effect=lambda: fake_now[0]
+        ):
+            await manager.start_reading_session()
+
+        # 缺 synckey 的那次未计入，下次 rt 仍从同一起点算，时长不丢
+        self.assertEqual(seen_last_times[0], seen_last_times[1])
+
     async def test_break_time_is_excluded_from_next_report(self):
         clock = FakeClock()
         manager = self._manager([], clock, target="10")

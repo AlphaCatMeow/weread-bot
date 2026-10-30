@@ -90,7 +90,9 @@ class LoginCurlTests(unittest.TestCase):
         self.assertEqual(cookies["wr_rt"], "rt%2Ftoken%2B%3D")
         self.assertEqual(headers["user-agent"], CHROME_UA)
         self.assertEqual(data["appId"], "wb182564874663h1256619504")
-        self.assertEqual(data["ps"], bot.encode_weread_id("0"))
+        self.assertNotEqual(data["ps"], bot.encode_weread_id("0"))
+        self.assertNotEqual(data["ps"], data["pc"])
+        self.assertEqual((data["co"], data["sm"], data["pr"]), (0, "", 0))
         self.assertNotIn("b", data)
 
     def test_generated_curl_omits_empty_refresh_token(self):

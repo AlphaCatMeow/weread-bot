@@ -1651,8 +1651,13 @@ async def interruptible_sleep(
 
 
 def is_successful_read_response(response_data: Dict[str, Any]) -> bool:
-    """succ 为真即视为成功；当前接口常只返回 {succ: 1}，不带 synckey。"""
-    return bool(response_data.get("succ"))
+    """仅接受同时包含真值 succ 和非空 synckey 的响应。
+
+    只有 {succ: 1} 时服务端没有同步本次 rt，不能算作阅读成功。
+    """
+    return bool(response_data.get("succ")) and bool(
+        response_data.get("synckey")
+    )
 
 
 def load_curl_source(
@@ -3491,9 +3496,11 @@ class WeReadSessionManager:
         "b": "book_id",  # 书籍或章节的唯一标识符
         "c": "chapter_id",  # 内容的唯一标识符，可能是页面或具体段落
         "ci": "chapter_index",  # 章节或部分的索引
-        "co": "page_number",  # 内容的具体位置或页码
-        "sm": "content",  # 当前阅读的内容描述或摘要
-        "pr": "page_number",  # 页码或段落索引
+        # co/sm/pr 必须是合法值：发占位字符串或缺省时，服务端只回 {succ: 1}
+        # 不返回 synckey，也不计入阅读时长
+        "co": 0,  # 章节内的字符偏移
+        "sm": "",  # 当前位置的正文摘要
+        "pr": 0,  # 阅读进度百分比
         "rt": "reading_time",  # 阅读时长或阅读进度
         "ts": time.time() * 1000,  # 时间戳，毫秒级
         "rn": "random_number",  # 随机数或请求编号
@@ -3811,13 +3818,18 @@ class WeReadSessionManager:
                 "阅读请求成功，响应字段: %s",
                 ", ".join(sorted(response_data.keys())),
             )
-            if not response_data.get('synckey'):
-                logging.debug(
-                    "阅读响应缺少 synckey，调用 chapterInfos 修复: "
-                    f"book={self.data.get('b')}, chapter={self.data.get('c')}"
-                )
-                await self._fix_no_synckey()
             return True, response_time
+
+        if response_data.get('succ'):
+            # 本次 rt 未被计入；不推进 last_time，下次上报时一并补上
+            logging.warning(
+                self._build_protocol_warning(
+                    "阅读响应缺少 synckey，本次时长未计入",
+                    f"book={self.data.get('b')}, chapter={self.data.get('c')}",
+                )
+            )
+            await self._fix_no_synckey()
+            return False, response_time
 
         logging.warning(
             self._build_protocol_warning(
@@ -4404,10 +4416,15 @@ def build_login_curl_command(credentials: QrLoginCredentials) -> str:
         "user-agent": credentials.user_agent,
     }
     # 不写入 b/c，阅读位置回退到 reading.books
+    # 浏览器中 ps/pc 是打开阅读页时的秒级时间戳编码，pc 比 ps 晚 1-3 秒
+    opened_at = int(time.time())
     payload = {
         "appId": generate_web_app_id(credentials.user_agent),
-        "ps": encode_weread_id("0"),
-        "pc": encode_weread_id("0"),
+        "co": 0,
+        "sm": "",
+        "pr": 0,
+        "ps": encode_weread_id(str(opened_at)),
+        "pc": encode_weread_id(str(opened_at + random.randint(1, 3))),
     }
     return build_curl_command(headers, cookies, payload)
 
